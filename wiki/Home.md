@@ -1,9 +1,5 @@
 # GPU Inference Service — Architecture Wiki
 
-Source of truth: `ref/inference-service-kb/CLAUDE.md`, `docs/decisions.md`, and the diagram
-`assets/inference-stack-v3.drawio`. This wiki restructures that material one page per band/component
-for easier browsing. If this wiki and the source docs ever disagree, the source docs win — update this
-wiki to match, not the other way around.
 
 ## What we're building
 
