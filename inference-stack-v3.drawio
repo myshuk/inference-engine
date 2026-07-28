@@ -1,0 +1,173 @@
+<mxfile host="Electron" agent="Claude">
+  <diagram id="stack-v3" name="Inference Stack v3 — agentgateway consolidated">
+    <mxGraphModel dx="2608" dy="822" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1960" pageHeight="1300" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="note" parent="1" style="text;html=1;fontSize=12;fontStyle=2;align=left;verticalAlign=middle;" value="Bands are FUNCTIONS APPLIED IN ORDER, not network hops. agentgateway is one process performing bands 2–4 internally.   ·   dashed = deferred / optional   ·   ⚠ = decision or gotcha to settle deliberately" vertex="1">
+          <mxGeometry height="24" width="1890" x="40" y="10" as="geometry" />
+        </mxCell>
+        <mxCell id="b1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=14;fontSize=12;fillColor=#f5f5f5;strokeColor=#666666;" value="Band 1 · Clients — just API calls.  Four decisions live here: OpenAI-schema compatibility · streaming is the default · /v1 in the path from day one · whether you promise not to log prompts." vertex="1">
+          <mxGeometry height="70" width="1200" x="40" y="50" as="geometry" />
+        </mxCell>
+        <mxCell id="b2" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=right;spacingRight=12;fontSize=13;fontStyle=1;fillColor=#dae8fc;strokeColor=#6c8ebf;container=1;collapsible=0;" value="Band 2 · Ingress, DDoS, TLS" vertex="1">
+          <mxGeometry height="190" width="1200" x="40" y="150" as="geometry" />
+        </mxCell>
+        <mxCell id="b2a" parent="b2" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#6c8ebf;" value="&lt;b&gt;Cloudflare / Fastly&lt;/b&gt;&lt;br&gt;GeoDNS + anycast, volumetric DDoS scrubbing, WAF, bot mgmt, client TLS.&lt;br&gt;⚠ Disable buffering &amp; compression on text/event-stream.&lt;br&gt;⚠ Cannot inspect streaming response bodies — output guardrails happen in band 4. Protects portal / webhooks / docs normally.&lt;br&gt;&lt;i&gt;Only part of the stack with no self-host answer: you cannot absorb 500Gbps on your own transit.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="135" width="325" x="500" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="b2b" parent="b2" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#6c8ebf;" value="&lt;b&gt;MetalLB + BGP&lt;/b&gt; &lt;i&gt;(Apache 2.0)&lt;/i&gt;&lt;br&gt;Nodes advertise a VIP; DC routers ECMP-hash flows across them. &lt;b&gt;No physical LB required&lt;/b&gt; — the routers are the balancer.&lt;br&gt;⚠ Ask the network team for &lt;b&gt;resilient hashing&lt;/b&gt;: adding/removing an edge node re-hashes flows and kills live streams.&lt;br&gt;&lt;i&gt;Alt: Cilium BGP if Cilium is your CNI (one fewer component) · kube-vip · or an existing F5 holds the VIP and MetalLB drops out.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="135" width="325" x="845" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="b3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=right;spacingRight=12;fontSize=13;fontStyle=1;fillColor=#d5e8d4;strokeColor=#82b366;container=1;collapsible=0;" value="Band 3 · Identity, tenancy, counters" vertex="1">
+          <mxGeometry height="200" width="1200" x="40" y="360" as="geometry" />
+        </mxCell>
+        <mxCell id="b3a" parent="b3" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#82b366;" value="&lt;b&gt;PostgreSQL&lt;/b&gt; &lt;i&gt;(PostgreSQL licence)&lt;/i&gt;&lt;br&gt;Orgs → projects → hashed API keys, plans, per-key limits, model allow-lists.&lt;br&gt;⚠ &lt;b&gt;agentgateway enforces, Postgres remembers&lt;/b&gt; — CEL policies decide, but evaluate against records that must be created/updated/durable somewhere; not agentgateway config, not lossy-by-design Valkey.&lt;br&gt;&lt;b&gt;This is your domain model, not the IdP&#39;s.&lt;/b&gt; API auth = key lookup (cached in Valkey), not an OAuth flow.&lt;br&gt;&lt;i&gt;OPA removed: &quot;can tenant X call model Y&quot; is a DB row and a boolean. Revisit only if policy genuinely outgrows code.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="160" width="325" x="500" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="b3b" parent="b3" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#82b366;" value="&lt;b&gt;Envoy Rate Limit Service → Valkey&lt;/b&gt; &lt;i&gt;(Apache 2.0 / BSD-3, LF)&lt;/i&gt;&lt;br&gt;agentgateway calls RLS over gRPC; Valkey holds the shared state:&lt;br&gt;• RPM + TPM token buckets  • cached spend counters  • idempotency keys&lt;br&gt;⚠ Bill from the usage events, never from these counters — they are lossy by design.&lt;br&gt;⚠ &lt;b&gt;RLS has no refund/amend call&lt;/b&gt; (confirmed in rls.proto — hits_addend is unsigned, ShouldRateLimit is atomic check-and-increment only). The max_tokens reservation holds for the full window; &quot;amend&quot; only corrects the Kafka billing record, never this counter.&lt;br&gt;&lt;i&gt;Valkey for permissive licence + LF governance. Redis 8 is AGPLv3 (OSI open source) and fine for internal use — the copyleft does not reach internal deployments.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="145" width="325" x="845" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="b4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=right;spacingRight=12;fontSize=13;fontStyle=1;fillColor=#ffe6cc;strokeColor=#d79b00;container=1;collapsible=0;" value="Band 4 · Inference routing" vertex="1">
+          <mxGeometry height="200" width="1200" x="40" y="580" as="geometry" />
+        </mxCell>
+        <mxCell id="b4a" parent="b4" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#d79b00;" value="&lt;b&gt;Gateway API Inference Extension&lt;/b&gt; &lt;i&gt;(Apache 2.0 · K8s SIG)&lt;/i&gt;&lt;br&gt;&lt;b&gt;InferencePool&lt;/b&gt; — GA/v1, groups vLLM replicas into a routable backend.&lt;br&gt;&lt;b&gt;Endpoint Picker (EPP)&lt;/b&gt; scores replicas via QueueScorer (queue depth) + KVCacheUtilizationScorer (KV-cache) + prefix-cache affinity + LoRA-adapter awareness.&lt;br&gt;&lt;b&gt;InferenceObjective&lt;/b&gt; (replaces old InferenceModel) — Priority field via x-gateway-inference-objective header; candidate for SLA tiers.&lt;br&gt;&lt;b&gt;InferenceModelRewrite&lt;/b&gt; — model-name matching/rewrite within a pool.&lt;br&gt;&lt;i&gt;agentgateway is a conformant GIE gateway (confirmed on the official implementations page) — enable with inferenceExtension.enabled=true. NGINX Gateway Fabric also conformant; Istio tracked.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="145" width="325" x="500" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="b4b" parent="b4" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#d79b00;dashed=1;" value="&lt;b&gt;llm-d &lt;i&gt;or&lt;/i&gt; NVIDIA Dynamo&lt;/b&gt; &lt;i&gt;(Apache 2.0)&lt;/i&gt; — PHASE 2&lt;br&gt;Scheduling intelligence behind the EPP:&lt;br&gt;• prefill / decode disaggregation&lt;br&gt;• tiered KV prefix cache (GPU → CPU → NVMe)&lt;br&gt;• workload-aware autoscaling&lt;br&gt;&lt;br&gt;&lt;i&gt;Defer. Needs separate GPU pools; this is where the real complexity budget goes and it only pays back at scale.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="145" width="325" x="845" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="agw" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=10;verticalAlign=top;spacingTop=8;fillColor=#ffe6cc;strokeColor=#d79b00;strokeWidth=3;" value="&lt;b style=&quot;font-size:14px&quot;&gt;agentgateway&lt;/b&gt;&lt;br&gt;&lt;i&gt;Apache 2.0 · Linux Foundation / AAIF · Rust · Gateway API&lt;/i&gt;&lt;br&gt;&lt;i&gt;Replaces Kong, LiteLLM and Envoy AI Gateway. One process, bands 2–4.&lt;/i&gt;&lt;br&gt;&lt;br&gt;&lt;b&gt;① FRONTEND policies&lt;/b&gt; &lt;i&gt;(connection level)&lt;/i&gt;&lt;br&gt;• TLS termination, HTTP/2, TCP + protocol settings&lt;br&gt;• long idle timeouts, SSE passthrough, connection draining&lt;br&gt;• access logging, tracing&lt;br&gt;&lt;br&gt;&lt;b&gt;② TRAFFIC policies&lt;/b&gt; &lt;i&gt;(route / tenant level)&lt;/i&gt;&lt;br&gt;• JWT · API key · basic auth · authorization rules · ExtAuthz&lt;br&gt;• rate limiting — &lt;b&gt;local&lt;/b&gt; in-process bucket + &lt;b&gt;remote&lt;/b&gt; RLS over gRPC&lt;br&gt;&amp;nbsp;&amp;nbsp;– type: requests (RPM) and type: tokens (TPM)&lt;br&gt;&amp;nbsp;&amp;nbsp;– two-phase: &lt;b&gt;estimate&lt;/b&gt; before dispatch → &lt;b&gt;amend&lt;/b&gt; with actual usage. ⚠ amend hits Kafka billing only — RLS has no refund call, so the Valkey reservation itself is never corrected&lt;br&gt;&amp;nbsp;&amp;nbsp;– conditional limits (anon vs authenticated, read vs write)&lt;br&gt;&amp;nbsp;&amp;nbsp;– &lt;b&gt;failureMode: failOpen | failClosed&lt;/b&gt; ⚠ open for rate limits, closed for spend caps&lt;br&gt;• transformation, CORS, timeouts, retries&lt;br&gt;• spend-cap check against cached counter&lt;br&gt;&lt;br&gt;&lt;b&gt;③ BACKEND policies&lt;/b&gt; &lt;i&gt;(upstream level)&lt;/i&gt;&lt;br&gt;• LLM provider handling, prompt guards / inline guardrails&lt;br&gt;• MCP + A2A tool federation, OpenAPI→MCP, per-tool RBAC&lt;br&gt;• OpenTelemetry token usage → metering&lt;br&gt;&lt;br&gt;&lt;b&gt;Policy = CEL expressions, not plugin code.&lt;/b&gt; No plugin marketplace; custom&lt;br&gt;in-path logic goes to an ExtAuthz / ExtProc sidecar. Body is only snapshotted&lt;br&gt;when a policy actually references it — critical for streaming.&lt;br&gt;&lt;br&gt;⚠ &lt;b&gt;Wiring:&lt;/b&gt; HTTPRoute → &lt;b&gt;AgentgatewayBackend&lt;/b&gt; → custom provider → InferencePool.&lt;br&gt;Routing straight to the InferencePool silently loses token counting = your billing." vertex="1">
+          <mxGeometry height="590" width="460" x="60" y="170" as="geometry" />
+        </mxCell>
+        <mxCell id="edgeopt" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=10;verticalAlign=middle;fillColor=#f5f5f5;strokeColor=#666666;dashed=1;" value="&lt;b&gt;Optional dedicated Envoy edge tier&lt;/b&gt; &lt;i&gt;(Apache 2.0)&lt;/i&gt; — &lt;b&gt;delete at MVP.&lt;/b&gt; agentgateway is itself an Envoy-class L7 data plane, so Cloudflare → agentgateway is complete. Reintroduce when (a) the non-LLM surface is real — portal, docs, OAuth callbacks, Stripe webhooks, status page — or (b) you no longer want tenant-policy changes sharing a failure domain with your TLS listener. Realistically: your first enterprise contract." vertex="1">
+          <mxGeometry height="60" width="1180" x="60" y="790" as="geometry" />
+        </mxCell>
+        <mxCell id="b5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=left;spacingLeft=12;fontSize=13;fontStyle=1;fillColor=#e1d5e7;strokeColor=#9673a6;container=1;collapsible=0;" value="Band 5 · Inference fleet — where tokens are actually made" vertex="1">
+          <mxGeometry height="240" width="1200" x="40" y="870" as="geometry" />
+        </mxCell>
+        <mxCell id="b5a" parent="b5" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#9673a6;strokeWidth=2;" value="&lt;b&gt;vLLM ← default&lt;/b&gt; &lt;i&gt;(Apache 2.0)&lt;/i&gt;&lt;br&gt;Continuous batching, PagedAttention, automatic prefix caching, chunked prefill, TP/PP, FP8 &amp; AWQ, speculative decoding, LoRA.&lt;br&gt;&lt;i&gt;Exposes the metrics the EPP scrapes.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="110" width="270" x="30" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="b5b" parent="b5" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#9673a6;" value="&lt;b&gt;SGLang&lt;/b&gt; &lt;i&gt;(Apache 2.0)&lt;/i&gt;&lt;br&gt;RadixAttention prefix reuse; often wins on agent and structured-output traffic.&lt;br&gt;&lt;i&gt;Benchmark per model, not per vendor.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="110" width="270" x="320" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="b5c" parent="b5" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#9673a6;" value="&lt;b&gt;TensorRT-LLM + Triton&lt;/b&gt;&lt;br&gt;&lt;i&gt;(Apache 2.0 / BSD-3; CUDA under NVIDIA EULA)&lt;/i&gt;&lt;br&gt;Max NVIDIA throughput via compiled engines; heavier build + ops cost.&lt;br&gt;&lt;i&gt;Premium latency tier only.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="110" width="270" x="610" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="b5d" parent="b5" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#f0eef2;strokeColor=#9673a6;dashed=1;" value="&lt;b&gt;KServe / Ray Serve&lt;/b&gt; + &lt;b&gt;LeaderWorkerSet&lt;/b&gt; &lt;i&gt;(Apache 2.0)&lt;/i&gt;&lt;br&gt;Serving CRDs, canary rollout, scale-to-zero.&lt;br&gt;LWS gang-schedules a multi-node TP/PP replica as one unit with all-or-nothing restart.&lt;br&gt;&lt;i&gt;Wraps whichever engine (left) is chosen — not an alternative to it.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="110" width="270" x="900" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="b5cap1" parent="b5" style="text;html=1;fontSize=10;fontStyle=2;align=left;fontColor=#9673a6;" value="EXECUTION ENGINES — pick one per deployment, benchmark per model" vertex="1">
+          <mxGeometry height="20" width="850" x="30" y="22" as="geometry" />
+        </mxCell>
+        <mxCell id="b5cap2" parent="b5" style="text;html=1;fontSize=10;fontStyle=2;align=left;fontColor=#9673a6;" value="ORCHESTRATION LAYER — wraps the engine" vertex="1">
+          <mxGeometry height="20" width="270" x="900" y="22" as="geometry" />
+        </mxCell>
+        <mxCell id="b5e" parent="b5" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;fillColor=#f8f5fa;strokeColor=#9673a6;" value="⚠ &lt;b&gt;Model weights are the licence risk that actually matters&lt;/b&gt; — you are reselling model output commercially. Qwen (Apache 2.0) and DeepSeek (MIT) are clean · Llama = community licence with an MAU threshold, attribution and output-use restrictions · Mistral is mixed, some models prohibit commercial use · Gemma has use-policy limits. Legal review of the lineup before launch." vertex="1">
+          <mxGeometry height="55" width="1140" x="30" y="170" as="geometry" />
+        </mxCell>
+        <mxCell id="b6" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=left;spacingLeft=12;fontSize=13;fontStyle=1;fillColor=#f5f5f5;strokeColor=#666666;container=1;collapsible=0;" value="Band 6 · GPU infrastructure" vertex="1">
+          <mxGeometry height="140" width="1200" x="40" y="1130" as="geometry" />
+        </mxCell>
+        <mxCell id="b6a" parent="b6" style="rounded=1;whiteSpace=wrap;html=1;fontSize=10;fillColor=#ffffff;strokeColor=#666666;strokeWidth=2;" value="&lt;b&gt;Kubernetes + NVIDIA GPU Operator&lt;/b&gt;&lt;br&gt;Driver/toolkit lifecycle, device plugin, MIG, node labelling.&lt;br&gt;&lt;b&gt;Umbrella deployment&lt;/b&gt; — also deploys/manages Node Feature Discovery and DCGM-exporter as its own sub-components (see boxes →), not separate installs." vertex="1">
+          <mxGeometry height="90" width="270" x="30" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="b6b" parent="b6" style="rounded=1;whiteSpace=wrap;html=1;fontSize=10;fillColor=#ffffff;strokeColor=#666666;" value="&lt;b&gt;NCCL over NVLink / InfiniBand&lt;/b&gt;&lt;br&gt;All-reduce for TP. &lt;b&gt;Library, not a deployment&lt;/b&gt; — ships inside vLLM/PyTorch (nvidia-nccl-cu* wheel); uses NVLink via the GPU Operator&#39;s driver for free.&lt;br&gt;⚠ Multi-node RDMA/GPUDirect needs the separately-deployed &lt;b&gt;Network Operator&lt;/b&gt; (MOFED driver, RDMA device plugin) — without it, NCCL silently falls back to slow TCP." vertex="1">
+          <mxGeometry height="90" width="270" x="320" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="b6c" parent="b6" style="rounded=1;whiteSpace=wrap;html=1;fontSize=10;fillColor=#ffffff;strokeColor=#666666;" value="&lt;b&gt;Kueue&lt;/b&gt; — the one standalone deployment in this band &lt;i&gt;(kubernetes-sigs, own Helm chart/namespace)&lt;/i&gt;&lt;br&gt;Gang scheduling; keeps a TP group inside one NVLink domain, using the node labels NFD already provides via the GPU Operator (left) — NFD itself isn&#39;t installed separately here." vertex="1">
+          <mxGeometry height="90" width="270" x="610" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="b6d" parent="b6" style="rounded=1;whiteSpace=wrap;html=1;fontSize=10;fillColor=#ffffff;strokeColor=#666666;" value="&lt;b&gt;DCGM + node health&lt;/b&gt; — &lt;i&gt;bundled with GPU Operator, not standalone&lt;/i&gt;&lt;br&gt;Ships as nvidia-dcgm-exporter, part of the GPU Operator stack.&lt;br&gt;XID errors, ECC/thermal/power telemetry, auto cordon + drain.&lt;br&gt;⚠ Probe generation ability, not liveness" vertex="1">
+          <mxGeometry height="90" width="270" x="900" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="cpA" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=left;spacingLeft=12;fontSize=13;fontStyle=1;fillColor=#f8cecc;strokeColor=#b85450;container=1;collapsible=0;" value="A · Customer-facing control plane &amp; billing" vertex="1">
+          <mxGeometry height="340" width="640" x="1290" y="50" as="geometry" />
+        </mxCell>
+        <mxCell id="cpA1" parent="cpA" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#b85450;strokeWidth=2;" value="&lt;b&gt;Developer portal — YOU BUILD THIS&lt;/b&gt;&lt;br&gt;Signup, org creation, key generate/rotate/revoke, usage by model and day, spend vs cap, payment method, invoices, docs + quickstart. Later: teams, roles, projects.&lt;br&gt;&lt;i&gt;Kong&#39;s portal would show API-call analytics — wrong unit. Your product&#39;s unit is tokens and money. Start with a docs site + manual provisioning.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="100" width="590" x="25" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="cpA2" parent="cpA" style="rounded=1;whiteSpace=wrap;html=1;fontSize=10;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#b85450;strokeWidth=2;" value="&lt;b&gt;Shared usage-event infrastructure: Kafka + ClickHouse&lt;/b&gt; &lt;i&gt;(Apache 2.0 — Kafka avoids Redpanda&#39;s BSL)&lt;/i&gt;&lt;br&gt;One Kafka topic — agentgateway&#39;s OTel usage events (prompt/cached/completion tokens), &lt;b&gt;the billing record of truth&lt;/b&gt; — feeding one ClickHouse warehouse (per tenant/model/hour rollups powering portal dashboards).&lt;br&gt;⚠ &lt;b&gt;One pair, not two.&lt;/b&gt; Point OpenMeter/Lago (below) at this same Kafka + ClickHouse — don&#39;t let it stand up a second, dedicated copy." vertex="1">
+          <mxGeometry height="105" width="590" x="25" y="155" as="geometry" />
+        </mxCell>
+        <mxCell id="cpA4" parent="cpA" style="rounded=1;whiteSpace=wrap;html=1;fontSize=10;align=left;spacingLeft=8;fillColor=#ffffff;strokeColor=#b85450;" value="&lt;b&gt;OpenMeter / Lago&lt;/b&gt; + &lt;b&gt;Stripe&lt;/b&gt; — rating (price books per tier, &lt;b&gt;cached-token discount&lt;/b&gt;, credits, spend caps) then payment.&lt;br&gt;⚠ Both OpenMeter and Lago use Kafka + ClickHouse internally by default — their Helm/deploy charts bundle a dedicated pair for &lt;i&gt;development&lt;/i&gt; convenience only. Configure the rating engine to consume from the shared pair above instead.&lt;br&gt;Spend state pushed back to Valkey for near-real-time cap enforcement." vertex="1">
+          <mxGeometry height="65" width="590" x="25" y="270" as="geometry" />
+        </mxCell>
+        <mxCell id="cpB" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=left;spacingLeft=12;fontSize=13;fontStyle=1;fillColor=#d5e8d4;strokeColor=#82b366;container=1;collapsible=0;dashed=1;" value="B · Identity — deferred until first enterprise SSO ask" vertex="1">
+          <mxGeometry height="140" width="640" x="1290" y="410" as="geometry" />
+        </mxCell>
+        <mxCell id="cpB1" parent="cpB" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;verticalAlign=top;spacingTop=6;fillColor=#ffffff;strokeColor=#82b366;dashed=1;" value="&lt;b&gt;Keycloak&lt;/b&gt; &lt;i&gt;(Apache 2.0)&lt;/i&gt; — authenticates &lt;b&gt;humans&lt;/b&gt; into the portal and into your own internal tooling (Grafana, Argo CD, admin consoles). SAML / OIDC federation to Okta and Entra ID.&lt;br&gt;⚠ &lt;b&gt;Never in the inference request path.&lt;/b&gt; API auth stays a hashed-key lookup.&lt;br&gt;&lt;i&gt;Alts: Zitadel, Authentik, Ory, WorkOS (commercial). MVP: email + password, thin abstraction so swapping in an IdP later is contained.&lt;/i&gt;" vertex="1">
+          <mxGeometry height="88" width="590" x="25" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="cpC" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=left;spacingLeft=12;fontSize=13;fontStyle=1;fillColor=#fff2cc;strokeColor=#d6b656;container=1;collapsible=0;" value="C · Model registry &amp; artifacts" vertex="1">
+          <mxGeometry height="230" width="640" x="1290" y="570" as="geometry" />
+        </mxCell>
+        <mxCell id="cpC1" parent="cpC" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;fillColor=#ffffff;strokeColor=#d6b656;" value="① &lt;b&gt;ENTRY — HF mirror + quantisation pipeline&lt;/b&gt; — pull upstream, build FP8 / AWQ variants, record evals &lt;b&gt;and the licence terms per model&lt;/b&gt; (the operational enforcement point for the Band 5 licensing risk)" vertex="1">
+          <mxGeometry height="50" width="590" x="25" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="cpC2" parent="cpC" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;fillColor=#ffffff;strokeColor=#d6b656;" value="② &lt;b&gt;STORAGE — Ceph / SeaweedFS&lt;/b&gt; &lt;i&gt;(LGPL / Apache — MinIO is AGPL + community edition feature-stripped)&lt;/i&gt; — S3-compatible weight store, safetensors shards" vertex="1">
+          <mxGeometry height="45" width="590" x="25" y="105" as="geometry" />
+        </mxCell>
+        <mxCell id="cpC3" parent="cpC" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;fillColor=#ffffff;strokeColor=#d6b656;" value="③ &lt;b&gt;DELIVERY — Run:ai Model Streamer / JuiceFS&lt;/b&gt; + &lt;b&gt;Harbor&lt;/b&gt; &lt;i&gt;(Apache 2.0)&lt;/i&gt; — fast weight load cuts replica cold start from minutes (matters for KEDA); Harbor holds signed, scanned engine images pinned per model version. Two parallel inputs into Band 5, not one." vertex="1">
+          <mxGeometry height="55" width="590" x="25" y="160" as="geometry" />
+        </mxCell>
+        <mxCell id="cpD" parent="1" style="rounded=1;whiteSpace=wrap;html=1;verticalAlign=top;align=left;spacingLeft=12;fontSize=13;fontStyle=1;fillColor=#dae8fc;strokeColor=#6c8ebf;container=1;collapsible=0;" value="D · Observability, scaling &amp; platform" vertex="1">
+          <mxGeometry height="290" width="640" x="1290" y="820" as="geometry" />
+        </mxCell>
+        <mxCell id="cpD1" parent="cpD" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;fillColor=#ffffff;strokeColor=#6c8ebf;" value="&lt;b&gt;Prometheus / VictoriaMetrics&lt;/b&gt; &lt;i&gt;(Apache 2.0)&lt;/i&gt; — scrapes vLLM + DCGM: TTFT, inter-token latency, tok/s, KV-cache utilisation, queue depth, &lt;b&gt;preemptions&lt;/b&gt; (= oversubscribed)" vertex="1">
+          <mxGeometry height="50" width="590" x="25" y="45" as="geometry" />
+        </mxCell>
+        <mxCell id="cpD2" parent="cpD" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;fillColor=#ffffff;strokeColor=#6c8ebf;" value="&lt;b&gt;Grafana / Loki / Tempo&lt;/b&gt; &lt;i&gt;(AGPLv3 — fine internally; legal review before embedding in the customer portal)&lt;/i&gt; + OpenTelemetry tracing" vertex="1">
+          <mxGeometry height="50" width="590" x="25" y="105" as="geometry" />
+        </mxCell>
+        <mxCell id="cpD3" parent="cpD" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;fillColor=#ffffff;strokeColor=#6c8ebf;" value="&lt;b&gt;KEDA&lt;/b&gt; &lt;i&gt;(Apache 2.0)&lt;/i&gt; — scales replica groups on queue depth and TTFT, not CPU.&lt;br&gt;⚠ Long termination grace periods, or scale-in truncates live streams." vertex="1">
+          <mxGeometry height="50" width="590" x="25" y="165" as="geometry" />
+        </mxCell>
+        <mxCell id="cpD4" parent="cpD" style="rounded=1;whiteSpace=wrap;html=1;fontSize=11;align=left;spacingLeft=8;fillColor=#ffffff;strokeColor=#6c8ebf;" value="&lt;b&gt;Argo CD + OpenTofu&lt;/b&gt; &lt;i&gt;(Terraform is BUSL)&lt;/i&gt; · &lt;b&gt;OpenBao&lt;/b&gt; &lt;i&gt;(Vault is BUSL)&lt;/i&gt; · &lt;b&gt;Trivy / Falco&lt;/b&gt; — GitOps, secrets, supply chain. Every engine-tuning change is a reviewed commit." vertex="1">
+          <mxGeometry height="55" width="590" x="25" y="225" as="geometry" />
+        </mxCell>
+        <mxCell id="mvp" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fontSize=12;align=left;spacingLeft=12;verticalAlign=middle;fillColor=#d5e8d4;strokeColor=#82b366;strokeWidth=2;" value="&lt;b&gt;MVP cut line&lt;/b&gt; — ship first: Cloudflare → agentgateway → &lt;b&gt;GIE (InferencePool + Endpoint Picker)&lt;/b&gt; → vLLM on K8s + GPU Operator · Postgres + Valkey · Prometheus/Grafana · docs site + manual key provisioning · Stripe.&lt;br&gt;⚠ GIE is day-one, not deferred — round-robin without it silently wastes GPU capacity (see D3).&lt;br&gt;&lt;b&gt;Add as you grow, roughly in order:&lt;/b&gt; self-serve portal → Kafka + ClickHouse metering → KEDA autoscaling → Keycloak SSO → dedicated Envoy edge → llm-d / Dynamo." vertex="1">
+          <mxGeometry height="150" width="640" x="1290" y="1130" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="b1" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="b2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="b4" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.75;entryY=0;entryDx=0;entryDy=0;" target="b5">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="b5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;strokeWidth=2;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" target="b6">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="agw" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;exitX=1;exitY=0.75;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="cpA" value="OTel token usage → billing">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="1265" y="613" />
+              <mxPoint x="1265" y="220" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="b5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;exitX=0.9;exitY=0;exitDx=0;exitDy=0;entryX=0.9;entryY=1;entryDx=0;entryDy=0;" target="b4" value="KV util + queue depth scraped by EPP">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="cpC" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.4;entryDx=0;entryDy=0;" target="b5" value="weights + images">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="b5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;exitX=1;exitY=0.8;exitDx=0;exitDy=0;entryX=0;entryY=0.3;entryDx=0;entryDy=0;" target="cpD" value="metrics / logs / traces">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="cpA" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;fontSize=11;dashed=1;exitX=0;exitY=0.9;exitDx=0;exitDy=0;entryX=1;entryY=0.6;entryDx=0;entryDy=0;" target="b3" value="spend state → Valkey">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="b5" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;dashed=1;fontSize=11;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" target="b1" value="streamed tokens (SSE)">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="18" y="990" />
+              <mxPoint x="18" y="85" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
