@@ -1,0 +1,15 @@
+# agentgateway resolves InferencePool backends via native EndpointSlices, which
+# Kubernetes only creates for Pods behind a Service (GIE's own EPP watches Pods
+# directly instead, which is why it saw the mocks fine without this). Selector
+# matches the InferencePool's own selector (app=vllm-mock-pool) so this Service's
+# EndpointSlice covers both mock-a and mock-b.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-mock-pool
+spec:
+  selector:
+    app: vllm-mock-pool
+  ports:
+    - port: 8000
+      targetPort: 8000

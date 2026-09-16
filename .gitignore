@@ -216,3 +216,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Helm dependency .tgz fetched by `helm dependency update` -- pinned in each
+# Chart.yaml, regenerable, not something we author or want to vendor.
+# Chart.lock IS committed (records exact resolved versions/digests, same
+# role as a package-lock.json).
+poc/k8s/*/charts/
+
+# Scratch output from `kubectl kustomize`/`envsubst` -- regenerable from the
+# Kustomization + env.sh, not something we author or want to vendor.
+poc/k8s/*/.rendered-*.yaml
+
+# Corporate TLS-interception CA certs (Netskope) -- the cert subject embeds
+# the employer's name, not appropriate for a public repo. The fix these
+# enabled is documented in poc/exeReadme.md without needing the actual files.
+poc/extFiles/certs/

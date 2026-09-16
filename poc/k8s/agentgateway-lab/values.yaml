@@ -1,0 +1,12 @@
+# Overrides for the agentgateway subchart, pinned in Chart.yaml.
+agentgateway:
+  # Root cause of the long-standing "backendRef ... not found" InferencePool
+  # errors: agentgateway's InferencePools krt collection defaults to a
+  # permanently-empty static collection (controller/pkg/agentgateway/plugins/
+  # collection.go:209, "Disable by default") unless this is set -- it's a
+  # feature flag, not a bug. Maps to env var AGW_ENABLE_INFER_EXT via
+  # templates/deployment.yaml. Found by reading agentgateway's own source
+  # after RBAC, restarts, and a version bump (v1.4.1 -> v1.5.0-beta.1) all
+  # failed to change the symptom.
+  inferenceExtension:
+    enabled: true

@@ -1,0 +1,21 @@
+apiVersion: v2
+name: agentgateway-lab
+description: Umbrella chart pinning the agentgateway control plane for this POC
+version: 0.1.0
+
+# Same pattern as agentgateway-crds-lab/Chart.yaml -- pin + override only,
+# no vendored source. Installed as a separate release from the CRDs chart
+# (not bundled into one umbrella) because the CRDs must exist before this
+# controller starts, and Helm only honors the special crds/ install-first
+# behavior for a chart's own top-level crds/ directory, not a subchart's --
+# bundling both as dependencies of one umbrella risks silently skipping that
+# ordering guarantee.
+dependencies:
+  - name: agentgateway
+    # Bumped from v1.4.1 (temporary, deliberate): v1.4.1 predates a fix for
+    # InferencePool + AgentgatewayBackend custom-provider routing (agentgateway
+    # PR closing issue #2976, merged 2026-08-12) -- no stable release has it
+    # yet, only this beta. Revisit pinning back to a stable tag once one ships
+    # with the fix.
+    version: v1.5.0-beta.1
+    repository: oci://cr.agentgateway.dev/charts

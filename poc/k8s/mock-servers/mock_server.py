@@ -1,0 +1,159 @@
+"""Mock vLLM-shaped backend for the vllm-mock-pool InferencePool.
+
+Serves just enough of the real vLLM surface for EPP to route to it and for a
+client to get a valid OpenAI-shaped response:
+  - GET  /health            readiness probe
+  - GET  /metrics           Prometheus text format: vllm:num_requests_waiting,
+                             vllm:kv_cache_usage_perc (the names queue-scorer /
+                             kv-cache-utilization-scorer actually read)
+  - GET  /control           current metric values, as JSON
+  - POST /control           set metric values, e.g. {"num_requests_waiting": 50}
+  - POST /v1/chat/completions   streaming + non-streaming, response content
+                                 identifies which pod answered
+"""
+
+import json
+import os
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+POD_NAME = os.environ.get("POD_NAME", "unknown-pod")
+MODEL_NAME = os.environ.get("MODEL_NAME", "mock-model")
+PORT = int(os.environ.get("PORT", "8000"))
+
+state_lock = threading.Lock()
+state = {
+    "num_requests_waiting": float(os.environ.get("INIT_NUM_REQUESTS_WAITING", "0")),
+    "kv_cache_usage_perc": float(os.environ.get("INIT_KV_CACHE_USAGE_PERC", "0.1")),
+}
+
+
+def fake_usage(messages, completion_text):
+    prompt_tokens = sum(len(m.get("content", "").split()) for m in messages) or 1
+    completion_tokens = len(completion_text.split())
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print(f"[{POD_NAME}] {self.address_string()} - {fmt % args}")
+
+    def _send_json(self, status, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send_json(200, {"status": "ok", "pod": POD_NAME})
+        elif self.path == "/metrics":
+            with state_lock:
+                waiting = state["num_requests_waiting"]
+                kv = state["kv_cache_usage_perc"]
+            body = (
+                "# HELP vllm:num_requests_waiting Number of requests waiting to be processed.\n"
+                "# TYPE vllm:num_requests_waiting gauge\n"
+                f"vllm:num_requests_waiting {waiting}\n"
+                "# HELP vllm:kv_cache_usage_perc GPU KV-cache usage percentage.\n"
+                "# TYPE vllm:kv_cache_usage_perc gauge\n"
+                f"vllm:kv_cache_usage_perc {kv}\n"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/control":
+            with state_lock:
+                self._send_json(200, dict(state))
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            body = json.loads(raw or b"{}")
+        except json.JSONDecodeError:
+            self._send_json(400, {"error": "invalid json"})
+            return
+
+        if self.path == "/control":
+            with state_lock:
+                for key in ("num_requests_waiting", "kv_cache_usage_perc"):
+                    if key in body:
+                        state[key] = float(body[key])
+                result = dict(state)
+            self._send_json(200, result)
+            return
+
+        if self.path == "/v1/chat/completions":
+            self._handle_chat_completions(body)
+            return
+
+        self._send_json(404, {"error": "not found"})
+
+    def _handle_chat_completions(self, body):
+        messages = body.get("messages", [])
+        model = body.get("model", MODEL_NAME)
+        stream = bool(body.get("stream", False))
+        include_usage = bool(body.get("stream_options", {}).get("include_usage", False))
+        content = f"mock response from {POD_NAME}"
+        usage = fake_usage(messages, content)
+        created = int(time.time())
+        completion_id = f"mockcmpl-{POD_NAME}-{uuid.uuid4().hex[:8]}"
+
+        if not stream:
+            self._send_json(200, {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop",
+                }],
+                "usage": usage,
+            })
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        def chunk(delta, finish_reason=None, with_usage=None):
+            payload = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+            }
+            if with_usage is not None:
+                payload["usage"] = with_usage
+            self.wfile.write(f"data: {json.dumps(payload)}\n\n".encode())
+
+        chunk({"role": "assistant", "content": ""})
+        for word in content.split():
+            chunk({"content": word + " "})
+        chunk({}, finish_reason="stop")
+        if include_usage:
+            chunk({}, with_usage=usage)
+        self.wfile.write(b"data: [DONE]\n\n")
+
+
+if __name__ == "__main__":
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    print(f"[{POD_NAME}] mock vLLM backend listening on :{PORT}")
+    server.serve_forever()

@@ -1,0 +1,21 @@
+# The corrected wiring per acceptance criterion 4: HTTPRoute -> AgentgatewayBackend
+# -> custom provider -> InferencePool, instead of a raw HTTPRoute -> InferencePool
+# backendRef. Schema confirmed against agentgateway's own
+# controller/api/v1alpha1/agentgateway/agentgateway_backend_types.go: a "custom"
+# LLM provider's backendRef may target a Service or (group:
+# inference.networking.k8s.io, kind: InferencePool) -- exactly this case. The
+# "Completions" format matches our mocks' OpenAI-compatible /v1/chat/completions.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayBackend
+metadata:
+  name: vllm-mock-pool-backend
+spec:
+  ai:
+    provider:
+      custom:
+        backendRef:
+          group: inference.networking.k8s.io
+          kind: InferencePool
+          name: vllm-mock-pool
+        formats:
+          - type: Completions

@@ -1,0 +1,46 @@
+# Wires agentgateway's real traffic-policy stage to call the RLS deployment
+# built and independently verified earlier -- the domain/descriptor keys here
+# match poc/k8s/rls/config.yaml exactly (api_key_rpm, api_key_tpm), so this
+# is the same rate limiting we already proved out via grpcurl, now on the live
+# request path instead of a synthetic test call.
+#
+# Option 1 (agentgateway's native pattern, not a manual D11-style estimate+amend
+# reconstruction -- see poc/README.md Phase 3 step 5 for the reasoning):
+#   - api_key_rpm: unit Requests, cost defaults to 1, checked pre-dispatch.
+#   - api_key_tpm: unit Tokens, cost defaults to the real total token count,
+#     charged once, after the response completes. No reservation/estimate step
+#     at all -- this is *why* there's nothing to "amend": it never guesses.
+#
+# No real API-key authentication is wired yet (that's Band 3's separate
+# APIKeyAuthentication policy, not built) -- the descriptor value is read
+# directly from an x-api-key request header for now, matching the seeded
+# plaintext key in poc/k8s/postgres/schema.sql.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: vllm-mock-pool-rate-limit
+  namespace: inference-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: vllm-mock-pool-inference-route
+  traffic:
+    rateLimit:
+      global:
+        backendRef:
+          group: ""
+          kind: Service
+          name: rls
+          namespace: identity-tenancy
+          port: 8081
+        domain: inference-poc
+        descriptors:
+          - entries:
+              - name: api_key_rpm
+                expression: "request.headers[\"x-api-key\"]"
+            unit: Requests
+          - entries:
+              - name: api_key_tpm
+                expression: "request.headers[\"x-api-key\"]"
+            unit: Tokens

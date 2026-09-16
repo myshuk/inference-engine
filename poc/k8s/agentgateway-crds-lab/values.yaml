@@ -1,0 +1,4 @@
+# Overrides for the agentgateway-crds subchart, pinned in Chart.yaml.
+# Empty/default-matching for now -- explicit here mainly so intent is
+# visible without having to open the upstream chart's own values.yaml.
+agentgateway-crds: {}

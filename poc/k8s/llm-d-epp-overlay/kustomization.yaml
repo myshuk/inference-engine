@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# llm-d-router ships deploy/environments/dev overlays for Istio and kgateway only.
+# This is the equivalent overlay for agentgateway: same generic
+# deploy/components/inference-gateway base, patched for our GatewayClass instead.
+namespace: ${NAMESPACE}
+
+resources:
+  - https://github.com/llm-d/llm-d-router/deploy/components/inference-gateway?ref=v0.10.0
+  - epp-configmap.yaml
+
+patches:
+  - path: patch-gateways.yaml
+  - path: patch-httproute-backend.yaml
+
+# NOTE: the base's ${VAR} placeholders (EPP_NAME, POOL_NAME, EPP_IMAGE, etc.) are
+# shell-style, not Kustomize vars -- Kustomize will NOT resolve them. Render with
+# `kubectl kustomize`, then pipe through `envsubst` using env.sh's values, matching
+# how llm-d-router's own scripts/kind-dev-env.sh does it.

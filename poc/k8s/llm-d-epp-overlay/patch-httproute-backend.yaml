@@ -1,0 +1,22 @@
+# Criterion 4's corrected wiring: route through the AgentgatewayBackend custom
+# provider (poc/k8s/mock-servers/agentgateway-backend.yaml) instead of the base's
+# raw HTTPRoute -> InferencePool backendRef. The raw form also turned out to hit
+# an agentgateway v1.4.1 bug (see agentgateway-lab/rbac-inferencepool-patch.yaml
+# comment) that blocks it from routing at all, not just from preserving token
+# counts -- this patch is both the fix and the criterion-4 comparison target.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ${POOL_NAME}-inference-route
+spec:
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - group: agentgateway.dev
+      kind: AgentgatewayBackend
+      name: vllm-mock-pool-backend
+    timeouts:
+      request: 30s

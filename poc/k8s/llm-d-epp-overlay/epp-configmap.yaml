@@ -1,0 +1,43 @@
+# Wraps llm-d-router's deploy/config/epp-config.yaml as the ConfigMap the base
+# Deployment mounts at /etc/epp/epp-config.yaml.
+#
+# Added queue-scorer + kv-cache-utilization-scorer alongside the sample's
+# prefix-cache-scorer (schema confirmed against llm-d-router's own
+# soft-reflective-ceiling-epp-config.yaml sample -- both are zero-parameter
+# plugin types). These read vllm:num_requests_waiting / vllm:kv_cache_usage_perc
+# scraped from each pod's own :8000/metrics, which the two mock servers expose
+# and can be told to change on demand via their /control endpoint -- gives
+# criterion 3 a deterministic, controllable signal to test against. Weighted
+# higher (2) than prefix-cache-scorer (1) so repeated identical test prompts
+# don't let prefix affinity fight the queue/KV-cache signal being demonstrated.
+#
+# Note vs. our own wiki (Band 4): plugin names here (queue-scorer,
+# kv-cache-utilization-scorer) match the wiki's QueueScorer/KVCacheUtilizationScorer
+# in spirit; real metric name is vllm:kv_cache_usage_perc. Wiki has been updated
+# with the current plugin/metric names -- see wiki/Band-4-Inference-Routing.md.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: epp-config
+data:
+  epp-config.yaml: |
+    apiVersion: llm-d.ai/v1alpha1
+    kind: EndpointPickerConfig
+    plugins:
+    - type: prefix-cache-scorer
+    - type: queue-scorer
+    - type: kv-cache-utilization-scorer
+    - type: decode-filter
+    - type: max-score-picker
+    - type: single-profile-handler
+    schedulingProfiles:
+    - name: default
+      plugins:
+      - pluginRef: decode-filter
+      - pluginRef: max-score-picker
+      - pluginRef: prefix-cache-scorer
+        weight: 1
+      - pluginRef: queue-scorer
+        weight: 2
+      - pluginRef: kv-cache-utilization-scorer
+        weight: 2

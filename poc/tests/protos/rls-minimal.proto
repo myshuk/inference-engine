@@ -1,0 +1,57 @@
+syntax = "proto3";
+package envoy.service.ratelimit.v3;
+
+// Minimal, dependency-free version of envoy.service.ratelimit.v3's rls.proto,
+// for grpcurl testing only. Field numbers match the real proto exactly (wire
+// format is what matters, not which fields a client declares) -- validate.proto
+// rules, udpa versioning annotations, and unused response fields (Quota,
+// dynamic_metadata, response/request header lists) are dropped since they
+// don't affect this test.
+
+service RateLimitService {
+  rpc ShouldRateLimit(RateLimitRequest) returns (RateLimitResponse) {}
+}
+
+message RateLimitDescriptor {
+  message Entry {
+    string key = 1;
+    string value = 2;
+  }
+  repeated Entry entries = 1;
+}
+
+message RateLimitRequest {
+  string domain = 1;
+  repeated RateLimitDescriptor descriptors = 2;
+  uint32 hits_addend = 3;
+}
+
+message RateLimitResponse {
+  enum Code {
+    UNKNOWN = 0;
+    OK = 1;
+    OVER_LIMIT = 2;
+  }
+  message RateLimit {
+    enum Unit {
+      UNKNOWN = 0;
+      SECOND = 1;
+      MINUTE = 2;
+      HOUR = 3;
+      DAY = 4;
+      WEEK = 7;
+      MONTH = 5;
+      YEAR = 6;
+    }
+    string name = 3;
+    uint32 requests_per_unit = 1;
+    Unit unit = 2;
+  }
+  message DescriptorStatus {
+    Code code = 1;
+    RateLimit current_limit = 2;
+    uint32 limit_remaining = 3;
+  }
+  Code overall_code = 1;
+  repeated DescriptorStatus statuses = 2;
+}

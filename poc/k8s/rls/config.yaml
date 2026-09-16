@@ -1,0 +1,16 @@
+# RLS domain config -- descriptors with no `value:` match ANY value under that
+# key, so the same limit definition applies per distinct api-key automatically
+# (RLS tracks counters per unique value it sees, not per descriptor definition).
+# Limits match the seeded "free" plan in poc/k8s/postgres/schema.sql
+# (rpm_limit=60, tpm_limit=10000) -- two separate descriptors so agentgateway
+# can check/increment RPM and TPM independently per request, per D11.
+domain: inference-poc
+descriptors:
+  - key: api_key_rpm
+    rate_limit:
+      unit: minute
+      requests_per_unit: 60
+  - key: api_key_tpm
+    rate_limit:
+      unit: minute
+      requests_per_unit: 10000

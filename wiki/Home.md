@@ -52,7 +52,8 @@ Cross-cutting references:
 - [ ] **GPU inventory**: model, count per node, NVLink vs PCIe, total VRAM. Blocks TP sizing, model
       lineup, and cost-per-token modelling.
 - [ ] Model lineup + licence review (biggest legal risk — see [Band 5](Band-5-Inference-Fleet.md))
-- [ ] SLA tiers and target latency percentiles — GIE's `InferenceObjective` CRD (`Priority` field,
-      SLO attainment planned) is a plausible mechanism; see [Band 4](Band-4-Inference-Routing.md)
+- [ ] SLA tiers and target latency percentiles — `llm-d-router`'s `InferenceObjective` CRD (`Priority`
+      field, SLO attainment planned; moved out of GIE proper, see [Band 4](Band-4-Inference-Routing.md))
+      is a plausible mechanism
 - [ ] Benchmark plan for engine config tuning
 - [ ] Cost-per-million-token model per GPU config

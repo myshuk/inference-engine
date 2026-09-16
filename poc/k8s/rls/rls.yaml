@@ -1,0 +1,76 @@
+# envoyproxy/ratelimit -- image staleness note: Docker Hub hasn't been pushed to
+# since March 2021 (broken CI credentials upstream, never fixed; confirmed via
+# their own GitHub Actions workflows -- only Docker Hub is targeted, no GHCR
+# mirror, and no new `v*` release tag since 2020). c03723f3 is the last image
+# actually published. amd64-only, needs emulation on this Apple Silicon Mac --
+# accepted deliberately to validate D11's two-phase estimate/amend pattern,
+# which is a stable, small piece of logic unlikely to have changed meaningfully
+# since 2021. Revisit if a maintained fork or GHCR mirror ever appears.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rls
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rls
+  template:
+    metadata:
+      labels:
+        app: rls
+    spec:
+      containers:
+        - name: rls
+          image: envoyproxy/ratelimit:c03723f3
+          command: ["/bin/ratelimit"]
+          env:
+            - name: RUNTIME_ROOT
+              value: /data/ratelimit
+            - name: RUNTIME_SUBDIRECTORY
+              value: ratelimit
+            - name: RUNTIME_IGNOREDOTFILES
+              value: "true"
+            - name: REDIS_SOCKET_TYPE
+              value: tcp
+            - name: REDIS_URL
+              value: valkey:6379
+            - name: USE_STATSD
+              value: "false"
+            - name: LOG_LEVEL
+              value: debug
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 8081
+            - name: debug
+              containerPort: 6070
+          volumeMounts:
+            - name: config
+              mountPath: /data/ratelimit/ratelimit/config
+          readinessProbe:
+            httpGet:
+              path: /healthcheck
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: config
+          configMap:
+            name: rls-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rls
+spec:
+  selector:
+    app: rls
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 8081
+      targetPort: 8081

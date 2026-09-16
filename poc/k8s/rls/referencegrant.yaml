@@ -1,0 +1,18 @@
+# Standard Gateway API cross-namespace reference: the AgentgatewayPolicy lives
+# in inference-poc (alongside the HTTPRoute it targets), but the RLS Service it
+# calls lives in identity-tenancy. Without this, the backendRef would be
+# rejected the same way a cross-namespace HTTPRoute backendRef would be.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-inference-poc-to-rls
+  namespace: identity-tenancy
+spec:
+  from:
+    - group: agentgateway.dev
+      kind: AgentgatewayPolicy
+      namespace: inference-poc
+  to:
+    - group: ""
+      kind: Service
+      name: rls

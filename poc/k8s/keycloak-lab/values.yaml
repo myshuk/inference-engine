@@ -1,0 +1,17 @@
+# Overrides for the keycloakx subchart, pinned in Chart.yaml.
+#
+# Scope: human signup only, per Control Plane B's own MVP note ("email + password,
+# behind a thin abstraction") -- no SSO/IdP federation, no HA, no external Postgres.
+# Dev mode (start-dev) uses Keycloak's built-in in-memory H2 database -- data is lost
+# on pod restart, which is fine for proving the signup flow works, not for anything
+# durable. Revisit with a real database + `start` (not `start-dev`) if this needs to
+# survive restarts.
+keycloakx:
+  args:
+    - start-dev
+
+  extraEnv: |
+    - name: KC_BOOTSTRAP_ADMIN_USERNAME
+      value: admin
+    - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+      value: admin-poc-only

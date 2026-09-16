@@ -1,0 +1,42 @@
+# agentgateway v1.4.1's own Helm-installed ClusterRole
+# (agentgateway-agentgateway-system) grants get/list/watch on every other
+# Gateway API resource it consumes (httproutes, gateways, backendtlspolicies,
+# ...) but has NO rule at all for inference.networking.k8s.io/inferencepools.
+# Its InferencePool krt collection is therefore permanently empty regardless
+# of what Pods/Services back the pool -- this is why a plain
+# HTTPRoute -> InferencePool route always resolves BackendNotFound, not just
+# a token-accounting gap as originally assumed. Confirmed by reading
+# agentgateway/agentgateway's own reference_indexes.go (DefaultRouteBackend)
+# and comparing against the installed ClusterRole's rules.
+#
+# Kept as a separate object (not a patch to the Helm-managed ClusterRole)
+# because `helm upgrade` would silently revert an in-place edit on the next
+# release. Applied alongside agentgateway-lab, not part of its Chart.yaml,
+# since it's a workaround for an upstream gap, not something we're pinning a
+# version of.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agentgateway-inferencepool-patch
+rules:
+  - apiGroups:
+      - inference.networking.k8s.io
+    resources:
+      - inferencepools
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agentgateway-inferencepool-patch
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agentgateway-inferencepool-patch
+subjects:
+  - kind: ServiceAccount
+    name: agentgateway
+    namespace: agentgateway-system
