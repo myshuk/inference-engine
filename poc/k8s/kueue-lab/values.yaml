@@ -1,0 +1,6 @@
+# Overrides for the kueue subchart, pinned in Chart.yaml. Empty/default-matching
+# for now -- Kueue's own internalCertManagement (the default when
+# enableCertManager is false) handles webhook certs itself, no cert-manager
+# dependency needed for this POC. Defaults already include batch/job in
+# integrations.frameworks, which is what the gang-scheduling test will use.
+kueue: {}

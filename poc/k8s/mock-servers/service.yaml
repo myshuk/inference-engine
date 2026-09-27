@@ -7,6 +7,14 @@ apiVersion: v1
 kind: Service
 metadata:
   name: vllm-mock-pool
+  # Distinct from spec.selector below (which is how this Service finds its
+  # pods) -- this is the Service *object's own* label, needed for the
+  # Prometheus ServiceMonitor (poc/k8s/prometheus-lab/service-monitors.yaml)
+  # to match it at all. Learned the hard way: ServiceMonitor.spec.selector
+  # matches metadata.labels, not spec.selector -- an empty one here meant
+  # zero targets discovered, not a scrape failure.
+  labels:
+    app: vllm-mock-pool
 spec:
   selector:
     app: vllm-mock-pool

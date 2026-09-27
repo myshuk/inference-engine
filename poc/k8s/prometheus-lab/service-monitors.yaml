@@ -1,0 +1,63 @@
+# Prometheus Operator only discovers ServiceMonitor/PodMonitor objects
+# carrying the release label matching our Helm release name -- left the
+# default restrictive selector alone (rather than loosening it cluster-wide)
+# and just labeled these objects instead. See poc/exeReadme.md for why.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: vllm-mock-pool
+  namespace: inference-poc
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: vllm-mock-pool
+  endpoints:
+    - targetPort: 8000
+      path: /metrics
+      interval: 15s
+---
+# agentgateway's data-plane /metrics has a genuine Content-Type-vs-body
+# mismatch bug (see poc/k8s/agentgateway-metrics-relay/relay.py for the full
+# root-cause writeup -- it's an upstream bug, not fixable via PodMonitor
+# fallbackScrapeProtocol/scrapeProtocols, both tried and confirmed useless
+# here) that makes Prometheus reject the whole scrape outright. Point at the
+# relay instead of the gateway pod directly -- it re-serves the identical
+# body under the correct header.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: agentgateway-metrics-relay
+  namespace: inference-poc
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: agentgateway-metrics-relay
+  endpoints:
+    - targetPort: 9114
+      path: /metrics
+      interval: 15s
+---
+# RLS itself still has no /metrics endpoint at all (confirmed 404; only
+# /healthcheck exists) -- this scrapes statsd_exporter instead, which RLS now
+# pushes its gostats metrics to over statsd/TCP (poc/k8s/rls/statsd-
+# exporter.yaml, USE_STATSD=true as of this change; RLS's gostats client
+# dials over TCP by default, not UDP).
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: statsd-exporter
+  namespace: identity-tenancy
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: statsd-exporter
+  endpoints:
+    - targetPort: 9102
+      path: /metrics
+      interval: 15s

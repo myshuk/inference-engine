@@ -1,0 +1,42 @@
+# Overrides for the kube-prometheus-stack subchart, pinned in Chart.yaml.
+#
+# Scope for this pass: Prometheus + Grafana only (per user decision -- KEDA
+# deferred to end of POC, GitOps/secrets/supply-chain stretch items deferred,
+# ask again later). Alertmanager disabled: no alerting use case yet in this POC.
+#
+# kubeControllerManager/kubeScheduler/kubeEtcd/kubeProxy disabled: on kind
+# these run as static pods bound to 127.0.0.1 only, not reachable by
+# Prometheus's ServiceMonitor-based scraping -- a well-known kind-specific
+# friction, not a bug in our config. kubeApiServer/kubelet/coreDns stay
+# enabled since those *are* reachable on kind.
+kube-prometheus-stack:
+  alertmanager:
+    enabled: false
+
+  grafana:
+    adminPassword: admin-poc-only
+
+  kubeControllerManager:
+    enabled: false
+  kubeScheduler:
+    enabled: false
+  kubeEtcd:
+    enabled: false
+  kubeProxy:
+    enabled: false
+
+  prometheus:
+    prometheusSpec:
+      # No storageSpec by default -- Prometheus runs on ephemeral storage tied
+      # to the pod's lifecycle, so the 10d retention setting doesn't survive a
+      # pod restart (which happens on every podman machine pause/resume in
+      # this project). Real PVC via kind's local-path-provisioner (confirmed
+      # working already -- same as Postgres's PVC) fixes that. No
+      # storageClassName set -- "standard" is the cluster default.
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 2Gi

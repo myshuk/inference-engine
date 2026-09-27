@@ -875,3 +875,331 @@ rm poc/k8s/rls/agentgateway-debug-params.yaml   # temporary file, not kept
 pytest -v
 # Result: 24 passed, 4 skipped (vLLM not running) -- test_09's two new tests both pass
 ```
+
+## Phase 4 — Band 6: GPU infrastructure (simulated)
+
+```bash
+# poc/k8s/kueue-lab/Chart.yaml -- dependency kueue v0.19.4, oci://registry.k8s.io/kueue/charts.
+# Confirmed both 0.19.3 and 0.19.4 actually pullable (unlike RLS, no staleness here).
+helm show chart oci://registry.k8s.io/kueue/charts/kueue --version 0.19.4
+
+cd poc/k8s/kueue-lab
+helm dependency update
+kubectl --context kind-inference-poc create namespace kueue-system
+helm --kube-context kind-inference-poc install kueue . -n kueue-system
+kubectl --context kind-inference-poc -n kueue-system get pods
+# Result: 1/1 Running
+
+kubectl --context kind-inference-poc get crd | grep kueue
+kubectl --context kind-inference-poc -n kueue-system logs deploy/kueue-controller-manager --tail=30
+# Result: 11 CRDs installed, internal cert management working ("CA certs are injected to webhooks"),
+# no cert-manager needed, all reconcilers started cleanly
+```
+
+### Fake GPU resource
+
+```bash
+kubectl --context kind-inference-poc patch node inference-poc-worker --subresource=status --type='json' -p='[
+  {"op": "add", "path": "/status/capacity/nvidia.com~1gpu", "value": "2"},
+  {"op": "add", "path": "/status/allocatable/nvidia.com~1gpu", "value": "2"}
+]'
+kubectl --context kind-inference-poc get node inference-poc-worker \
+  -o jsonpath='{.status.capacity.nvidia\.com/gpu}{"\n"}{.status.allocatable.nvidia\.com/gpu}{"\n"}'
+# Result: 2 / 2 -- JSON Pointer escaping: "/" in "nvidia.com/gpu" -> "~1" per RFC 6902
+```
+
+`poc/k8s/kueue-lab/fake-gpu-queue.yaml` -- ResourceFlavor (no node labels needed, single-worker-node POC)
++ ClusterQueue (nominalQuota nvidia.com/gpu: 2, matching the fabricated capacity) + gpu-jobs Namespace +
+LocalQueue. First apply used `kueue.x-k8s.io/v1beta1` -- got a deprecation warning, checked
+`kubectl explain --api-version=kueue.x-k8s.io/v1beta2`, confirmed identical field schema, bumped to v1beta2:
+
+```bash
+kubectl --context kind-inference-poc apply -f poc/k8s/kueue-lab/fake-gpu-queue.yaml
+kubectl --context kind-inference-poc get clusterqueue gpu-cluster-queue -o yaml
+kubectl --context kind-inference-poc -n gpu-jobs get localqueue gpu-queue -o yaml
+# Result: both Active=True, "Can admit new workloads" / "Can submit new workloads to localQueue"
+```
+
+### DRA -- checked, deliberately skipped for this pass
+
+```bash
+kubectl --context kind-inference-poc api-resources --api-group=resource.k8s.io
+# Result: DeviceClass/ResourceClaim/ResourceClaimTemplate/ResourceSlice already available (resource.k8s.io/v1) --
+# no feature-gate changes needed on this kind cluster
+
+gh api repos/kubernetes-sigs/kueue/contents/keps/2941-DRA/kep.yaml --jq '.content' | base64 -d | grep -iE "stage|status|latest-milestone"
+# Result: DRA support in Kueue is "beta" as of v0.19 (the version installed here)
+gh api repos/kubernetes-sigs/dra-example-driver --jq '.description, .archived'
+# Result: real, non-archived reference driver for hardware-free DRA testing -- exists as a future option,
+# not pursued now (classic extended-resource model is a different, separate thing from DRA)
+```
+
+### Quota-enforcement test -- as a pytest case, not a standalone manifest
+
+```bash
+# poc/tests/helpers.py -- added input_text param to kubectl() for piping YAML via stdin (kubectl apply -f -)
+# poc/tests/test_10_kueue.py -- submits 3 Jobs (unique name suffix per run) x 1 fake GPU each against
+# the 2-GPU ClusterQueue quota; polls spec.suspend on each (Kueue admission is async); asserts exactly
+# 1 of 3 stays suspended. Cleans up jobs in a finally block regardless of outcome.
+pytest -v
+# Result: 25 passed, 4 skipped (vLLM not running) -- test_10 passed on the first run
+```
+
+## Phase 5 — Control Plane D: observability
+
+Scoped up front: build Prometheus + Grafana now, defer KEDA to end of POC, defer Argo CD/OpenBao/Trivy/Falco
+(ask again later).
+
+### kube-prometheus-stack install
+
+```bash
+# poc/k8s/prometheus-lab/Chart.yaml -- dependency kube-prometheus-stack 91.4.1, prometheus-community repo.
+cd poc/k8s/prometheus-lab
+helm dependency update
+kubectl --context kind-inference-poc create namespace monitoring
+helm --kube-context kind-inference-poc install prometheus . -n monitoring
+kubectl --context kind-inference-poc -n monitoring get pods
+# Result: prometheus/grafana/alertmanager-disabled/kube-state-metrics/node-exporter all Running
+```
+
+`poc/k8s/prometheus-lab/values.yaml` -- Alertmanager disabled (no alerting use case yet);
+`kubeControllerManager`/`kubeScheduler`/`kubeEtcd`/`kubeProxy` disabled (on `kind` these run as static pods
+bound to `127.0.0.1` only, not reachable by ServiceMonitor-based scraping -- well-known `kind` limitation,
+confirmed via their target status showing `down` before disabling); `kubeApiServer`/`kubelet`/`coreDns` left
+enabled since those *are* reachable.
+
+Considered loosening `serviceMonitorSelectorNilUsesHelmValues`/`podMonitorSelectorNilUsesHelmValues` to
+`false` for easier cluster-wide discovery -- rejected after checking the actual blast radius (it only
+changes which ServiceMonitor/PodMonitor *objects* get watched, not raw pods; nothing else in the cluster
+creates such objects today, so the practical delta was zero, but it's a global setting affecting any future
+chart too). Left the default alone and labeled our own new objects with `release: prometheus` instead.
+
+### Persistent storage for Prometheus
+
+```bash
+# Checked a real storage provisioner exists before adding a PVC (kind's default StorageClass):
+kubectl --context kind-inference-poc get storageclass
+# Result: "standard" (rancher.io/local-path), marked (default)
+kubectl --context kind-inference-poc -n local-path-storage get pods
+# Result: local-path-provisioner Running
+kubectl --context kind-inference-poc -n identity-tenancy get pvc postgres-data
+# Result: Bound, 10+ days old -- same StorageClass already proven working
+```
+
+Added `storageSpec.volumeClaimTemplate` (2Gi, no `storageClassName` -- `standard` is the cluster default) to
+`poc/k8s/prometheus-lab/values.yaml`. Without this, `Prometheus.spec.storage` is unset and the TSDB lives on
+ephemeral storage tied to the pod's lifecycle -- the `retention: 10d` setting would be meaningless, since a
+pod restart (which happens on every `podman machine` pause/resume in this project) wipes all history.
+
+```bash
+helm --kube-context kind-inference-poc upgrade prometheus . -n monitoring
+kubectl --context kind-inference-poc -n monitoring get pvc
+# Result: Bound
+```
+
+### ServiceMonitor/PodMonitor for our own components
+
+```bash
+# poc/k8s/prometheus-lab/service-monitors.yaml -- ServiceMonitor for vllm-mock-pool (port 8000, /metrics),
+# PodMonitor for agentgateway's data-plane pod (port "metrics"=15020, no Service exposed it by name yet).
+# Both labeled release: prometheus to match the Operator's default discovery selector.
+kubectl --context kind-inference-poc apply -f service-monitors.yaml
+kubectl --context kind-inference-poc -n monitoring port-forward svc/prometheus-kube-prometheus-prometheus 9090:9090 &
+curl -s 'http://localhost:9090/api/v1/targets' | jq '.data.activeTargets[] | select(.scrapePool | contains("vllm-mock-pool"))'
+# Result: empty -- zero targets discovered, not a failed scrape
+```
+
+### Bug 1: vllm-mock-pool ServiceMonitor matched zero targets
+
+```bash
+kubectl --context kind-inference-poc -n inference-poc get svc vllm-mock-pool -o jsonpath='{.metadata.labels}'
+# Result: {} -- empty. spec.selector (how the Service finds its pods) was set, but metadata.labels
+# (what ServiceMonitor.spec.selector actually matches against) was never set.
+```
+
+Considered switching the ServiceMonitor to a match-all/empty selector instead of fixing the label --
+rejected: `inference-poc` namespace also has the unrelated `inference-gateway` Service (HTTP traffic on port
+80), which a match-all selector would incorrectly also pick up. Fixed the actual root cause instead: added
+`metadata.labels: {app: vllm-mock-pool}` to `poc/k8s/mock-servers/service.yaml`.
+
+```bash
+kubectl --context kind-inference-poc apply -f poc/k8s/mock-servers/service.yaml
+kubectl --context kind-inference-poc -n inference-poc get svc vllm-mock-pool -o jsonpath='{.metadata.labels}'
+# Result: {} -- still empty! File on disk confirmed correct (Read tool + cat). kubectl apply reported
+# "unchanged" without applying the new field.
+kubectl --context kind-inference-poc -n inference-poc label svc vllm-mock-pool app=vllm-mock-pool
+# Result: label applied immediately, persists -- proves nothing was stripping it, the issue was specifically
+# in how `kubectl apply` computed its diff for a newly-added field on an existing object.
+kubectl --context kind-inference-poc apply -f poc/k8s/mock-servers/service.yaml
+# Result: "unchanged", label still present -- file/cluster consistency restored going forward.
+curl -s 'http://localhost:9090/api/v1/targets' | jq '.data.activeTargets[] | select(.scrapePool | contains("vllm-mock-pool")) | .health'
+# Result: "up" x2 (mock-a, mock-b)
+```
+
+### Bug 2: agentgateway's /metrics rejects the entire scrape
+
+```bash
+curl -s 'http://localhost:9090/api/v1/targets' | jq '.data.activeTargets[] | select(.scrapePool | contains("agentgateway"))'
+# Result: health "down", lastError: "invalid metric type \"info\""
+POD=$(kubectl --context kind-inference-poc -n inference-poc get pods -l gateway.networking.k8s.io/gateway-name=inference-gateway -o jsonpath='{.items[0].metadata.name}')
+kubectl --context kind-inference-poc -n inference-poc port-forward pod/$POD 15020:15020 &
+curl -s -D- http://localhost:15020/metrics | grep -i content-type
+# Result: "text/plain;charset=utf-8"
+curl -s http://localhost:15020/metrics | grep -A1 "TYPE agentgateway_build"
+# Result: "# TYPE agentgateway_build info" -- "info" is an OpenMetrics-only type, illegal under text/plain,
+# which is why Prometheus rejects the WHOLE scrape (not just this one line) -- zero metrics collected,
+# including agentgateway_gen_ai_client_token_usage (the metric that proved criterion 4 in Phase 2).
+curl -s -H "Accept: application/openmetrics-text;version=1.0.0" -D- http://localhost:15020/metrics -o /dev/null | grep -i content-type
+# Result: still "text/plain;charset=utf-8" -- agentgateway ignores Accept-header content negotiation entirely
+```
+
+Checked agentgateway's own official monitoring chart (`helm show values oci://cr.agentgateway.dev/charts/agentgateway`)
+-- has `monitoring.enabled`/`serviceMonitor.enabled`/`proxy.podMonitor.enabled` toggles, but these just wire
+up scraping of the same broken endpoint; doesn't fix the underlying bug. Searched GitHub issues on
+`agentgateway/agentgateway` for "openmetrics"/"content-type"/"prometheus text/plain" -- no existing report.
+
+Tried two Prometheus-side CRD fields before concluding it needs a workaround, both empirically confirmed not
+to help:
+
+```bash
+kubectl --context kind-inference-poc explain podmonitor.spec.fallbackScrapeProtocol
+# "defines the protocol to use if a scrape returns blank, unparseable, or otherwise invalid Content-Type.
+#  It requires Prometheus >= v3.0.0." -- checked bundled version:
+kubectl --context kind-inference-poc -n monitoring get pods -l app.kubernetes.io/name=prometheus -o jsonpath='{.items[0].spec.containers[*].image}'
+# Result: quay.io/prometheus/prometheus:v3.14.0-distroless -- meets the requirement, tested anyway:
+# (added fallbackScrapeProtocol: OpenMetricsText1.0.0 to the PodMonitor's spec -- NOT per-endpoint, a
+#  top-level spec field)
+kubectl --context kind-inference-poc apply -f service-monitors.yaml
+curl -s 'http://localhost:9090/api/v1/targets' | jq -r '.data.activeTargets[] | select(.scrapePool|contains("agentgateway")) | .lastError'
+# Result: still "invalid metric type \"info\"" -- doesn't help. Confirmed why: agentgateway's Content-Type
+# header IS present and valid (maps to a real, recognized format), so this fallback -- which only triggers
+# on blank/unrecognized Content-Type -- never activates.
+
+# Also tested scrapeProtocols (controls Prometheus's outbound Accept-header preference order), using the
+# exact Accept string from agentgateway's own Rust unit test suite (confirmed via `gh api` fetch of
+# crates/agentgateway/src/management/metrics_server.rs at the deployed v1.5.0-beta.1 tag):
+curl -s -D- -o /dev/null "http://localhost:15020/metrics" \
+  -H "Accept: application/openmetrics-text;version=1.0.0;escaping=allow-utf-8;q=0.5,application/openmetrics-text;version=0.0.1;q=0.4,text/plain;version=1.0.0;escaping=allow-utf-8;q=0.3,text/plain;version=0.0.4;q=0.2,*/*;q=0.1" \
+  | grep -i content-type
+# Result: still "text/plain;charset=utf-8", even with this exact header -- confirmed at the deployed tag,
+# the ContentType enum only recognizes "text/plain" -> PlainText or a protobuf media type; there's no
+# openmetrics-text case at all in the negotiation logic. Both fields removed from service-monitors.yaml
+# afterward (dead config, would only confuse a future reader).
+```
+
+Root cause, confirmed by reading `crates/agentgateway/src/management/metrics_server.rs` at both the deployed
+tag and `main`: agentgateway uses the Rust `prometheus_client` crate, whose `encoding::text::encode`
+function is its *only* text encoder -- OpenMetrics-only by design, no classic-Prometheus-0.0.4 encoder
+exists in that crate at all. `MetricsFormat::PlainText` and `MetricsFormat::OpenMetricsText` both call that
+same encoder, but `PlainText` hardcodes `Content-Type: text/plain;charset=utf-8` regardless. Still true on
+`main` as of 2026-09 (just renamed the import) -- not fixed by a version bump.
+
+### Fix: standalone Content-Type-correcting relay
+
+Can't add a sidecar container to agentgateway's own pod -- it's managed by the GatewayClass controller,
+which reverts direct Deployment/pod-spec patches within seconds (established in Phase 3 getting trace logs
+working). Built a standalone relay instead:
+
+```bash
+# poc/k8s/agentgateway-metrics-relay/upstream-service.yaml -- plain Service selecting the gateway's own
+# pods by their existing label (gateway.networking.k8s.io/gateway-name=inference-gateway), port 15020.
+# Independent object, not touching the managed Deployment -- safe from controller reversion.
+# poc/k8s/agentgateway-metrics-relay/relay.py -- fetches upstream /metrics verbatim, re-serves the exact
+# same bytes under Content-Type: application/openmetrics-text;version=1.0.0;charset=utf-8.
+# poc/k8s/agentgateway-metrics-relay/configmap.yaml -- generated via
+# kubectl create configmap agentgateway-metrics-relay-code --from-file=relay.py --dry-run=client -o yaml
+# poc/k8s/agentgateway-metrics-relay/deployment.yaml -- python:3.12-slim, same pattern as mock_server.py.
+kubectl --context kind-inference-poc -n inference-poc apply -f poc/k8s/agentgateway-metrics-relay/
+kubectl --context kind-inference-poc -n inference-poc port-forward svc/agentgateway-metrics-relay 9114:9114 &
+curl -s -D- -o /tmp/relay_body.txt http://localhost:9114/metrics | grep -i content-type
+# Result: "application/openmetrics-text;version=1.0.0;charset=utf-8"
+grep "agentgateway_gen_ai_client_token_usage" /tmp/relay_body.txt | head -1
+# Result: real histogram data present -- the metric that proved criterion 4, now scrapable
+```
+
+Swapped the broken PodMonitor for a ServiceMonitor pointed at the relay's Service in
+`poc/k8s/prometheus-lab/service-monitors.yaml`, deleted the stale PodMonitor object (removing it from the
+file doesn't delete it from the cluster):
+
+```bash
+kubectl --context kind-inference-poc apply -f poc/k8s/prometheus-lab/service-monitors.yaml
+kubectl --context kind-inference-poc -n inference-poc delete podmonitor agentgateway-data-plane
+```
+
+### RLS: no /metrics endpoint at all
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/metrics   # via existing RLS port-forward
+# Result: 404 -- only /healthcheck exists. USE_STATSD=false means gostats only ever wrote to stdout logs.
+```
+
+Standard fix for a statsd-only emitter: `prom/statsd-exporter` sidecar.
+
+```bash
+# poc/k8s/rls/statsd-exporter.yaml -- Deployment + Service, ports 9125 (statsd) / 9102 (Prometheus /metrics)
+kubectl --context kind-inference-poc -n identity-tenancy apply -f poc/k8s/rls/statsd-exporter.yaml
+# Result: ErrImagePull on prom/statsd-exporter:v0.30.0 -- checked Docker Hub tags directly, v0.30.0 only
+# exists as "-distroless"; switched to v0.31.0 (a plain tag that does exist).
+```
+
+Flipped RLS to use it:
+
+```bash
+# poc/k8s/rls/rls.yaml -- USE_STATSD: "true", STATSD_HOST: statsd-exporter, STATSD_PORT: "9125"
+kubectl --context kind-inference-poc -n identity-tenancy apply -f poc/k8s/rls/rls.yaml
+kubectl --context kind-inference-poc -n identity-tenancy logs -l app=rls --tail=10
+# Result: "statsd connection error: dial tcp 10.96.37.97:9125: i/o timeout" -- RLS's gostats client dials
+# over TCP by default, but the Service only exposed port 9125 as UDP.
+```
+
+```bash
+# Added a second ports entry (statsd-tcp, same port 9125, protocol: TCP) to the Service.
+kubectl --context kind-inference-poc -n identity-tenancy apply -f poc/k8s/rls/statsd-exporter.yaml
+kubectl --context kind-inference-poc -n identity-tenancy get svc statsd-exporter -o jsonpath='{.spec.ports}'
+# Result: only 2 of the 3 ports present (statsd-udp, metrics) -- the TCP entry silently dropped. Same class
+# of "kubectl apply diffing quirk" as Bug 1 above: spec.ports' strategic-merge-patch key is "port", not
+# "name", so two entries sharing port: 9125 collide during the patch computation.
+kubectl --context kind-inference-poc -n identity-tenancy delete svc statsd-exporter
+kubectl --context kind-inference-poc -n identity-tenancy create -f poc/k8s/rls/statsd-exporter.yaml
+kubectl --context kind-inference-poc -n identity-tenancy get svc statsd-exporter -o jsonpath='{.spec.ports}'
+# Result: all 3 ports present now (delete + create instead of patch-apply)
+```
+
+```bash
+kubectl --context kind-inference-poc -n identity-tenancy logs -l app=rls --tail=15
+# Result: STILL "dial tcp ...:9125: i/o timeout" errors, but statsd-exporter's own /metrics already showed
+# real ratelimit_* data (statsd_exporter_tcp_connections_total: 1) -- one connection had succeeded and kept
+# delivering data, but repeated new dial attempts kept failing. Hypothesis: RLS's gostats client cached the
+# Service's OLD ClusterIP (resolved before the delete+recreate above assigned a new one).
+kubectl --context kind-inference-poc -n identity-tenancy rollout restart deployment/rls
+kubectl --context kind-inference-poc -n identity-tenancy logs -l app=rls --tail=20
+# Result: clean -- zero "dial tcp" errors after a fresh pod re-resolved DNS. Confirmed stable over a 30s
+# watch window; statsd_exporter_samples_total climbing steadily (1866 -> 14562), zero connection errors.
+```
+
+Added a ServiceMonitor for statsd-exporter (namespace `identity-tenancy`) alongside the relay's ServiceMonitor
+in `poc/k8s/prometheus-lab/service-monitors.yaml`.
+
+### End-to-end verification
+
+```bash
+curl -s 'http://localhost:9090/api/v1/targets' | jq -r '.data.activeTargets[] | select(.scrapePool|test("agentgateway|statsd")) | "\(.scrapePool) \(.health)"'
+# Result: serviceMonitor/inference-poc/agentgateway-metrics-relay/0 up
+#         serviceMonitor/identity-tenancy/statsd-exporter/0 up
+curl -s 'http://localhost:9090/api/v1/query?query=agentgateway_gen_ai_client_token_usage_sum' | jq '.data.result[0].value'
+curl -s 'http://localhost:9090/api/v1/query?query=ratelimit_service_config_load_success' | jq '.data.result[0].value'
+# Result: both queries return real values -- full pipeline confirmed working, not just "target up"
+```
+
+### Captured as an automated test, not just manual curl+kubectl inspection
+
+```bash
+# poc/tests/conftest.py -- added prometheus_port fixture (svc/prometheus-kube-prometheus-prometheus, 9090)
+# poc/tests/test_11_metrics.py -- confirms all three new targets show `up` via Prometheus's own
+# /api/v1/targets API, and that real (non-placeholder) data is queryable for each: the mocks'
+# vllm:kv_cache_usage_perc, a live request's agentgateway_gen_ai_client_token_usage_sum through the relay,
+# and RLS's ratelimit_service_config_load_success through statsd-exporter -- plus that Prometheus's PVC is
+# actually Bound, not ephemeral.
+pytest -v
+# Result: 30 passed, 4 skipped (vLLM not running) -- test_11's 5 new tests all pass, zero regressions
+```

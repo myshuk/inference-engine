@@ -1,0 +1,20 @@
+# Independent Service object (not part of the agentgateway-managed
+# Deployment) that selects the gateway's own pods by their existing label,
+# purely so the relay below has a stable address to fetch from. Safe to
+# apply -- unlike patching the managed Deployment/pod spec directly (which
+# the GatewayClass controller reverts within seconds, per poc/exeReadme.md),
+# a plain Service that merely *selects* those pods isn't touched by that
+# controller at all.
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentgateway-metrics-upstream
+  labels:
+    app: agentgateway-metrics-upstream
+spec:
+  selector:
+    gateway.networking.k8s.io/gateway-name: inference-gateway
+  ports:
+    - name: metrics
+      port: 15020
+      targetPort: metrics

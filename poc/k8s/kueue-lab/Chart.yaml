@@ -1,0 +1,12 @@
+apiVersion: v2
+name: kueue-lab
+description: Umbrella chart pinning Kueue (Band 6 gang-scheduling/quota) for this POC
+version: 0.1.0
+
+# Same pattern as agentgateway-lab/keycloak-lab -- pin + override only, no
+# vendored source. Kueue publishes an official chart directly to
+# registry.k8s.io (not a third-party mirror), confirmed pullable at this version.
+dependencies:
+  - name: kueue
+    version: 0.19.4
+    repository: oci://registry.k8s.io/kueue/charts

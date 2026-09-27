@@ -1,0 +1,41 @@
+# Kueue objects to schedule against the fabricated nvidia.com/gpu resource
+# patched onto inference-poc-worker's node status (kubectl patch --subresource=status --
+# see poc/exeReadme.md). No node labels/taints needed for this single-worker-node
+# POC, so the ResourceFlavor carries no nodeLabels.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: fake-gpu-flavor
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: gpu-cluster-queue
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory", "nvidia.com/gpu"]
+      flavors:
+        - name: fake-gpu-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: 4
+            - name: "memory"
+              nominalQuota: 4Gi
+            # Matches the fabricated capacity patched onto the worker node --
+            # the actual quota-enforcement boundary this whole phase exists to test.
+            - name: "nvidia.com/gpu"
+              nominalQuota: 2
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-jobs
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: gpu-queue
+  namespace: gpu-jobs
+spec:
+  clusterQueue: gpu-cluster-queue

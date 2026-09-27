@@ -1,0 +1,69 @@
+# prom/statsd-exporter -- official Prometheus project's bridge for apps that
+# only emit statsd metrics. RLS (envoyproxy/ratelimit) has no HTTP /metrics
+# endpoint at all (confirmed 404; only /healthcheck exists) -- its gostats
+# only went to stdout logs until now (USE_STATSD=false in rls.yaml). Flipping
+# that to true and pointing it here gives Prometheus something to scrape.
+# No mapping config: default 1:1 statsd-name passthrough (dots -> underscores)
+# is good enough for this POC, not aiming to rename/relabel metrics.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: statsd-exporter
+  labels:
+    app: statsd-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: statsd-exporter
+  template:
+    metadata:
+      labels:
+        app: statsd-exporter
+    spec:
+      containers:
+        - name: statsd-exporter
+          image: prom/statsd-exporter:v0.31.0
+          ports:
+            - name: statsd
+              containerPort: 9125
+              protocol: UDP
+            - name: metrics
+              containerPort: 9102
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 9102
+            initialDelaySeconds: 3
+            periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: statsd-exporter
+  # Own object's labels (distinct from spec.selector) -- needed for the
+  # Prometheus ServiceMonitor to match it. See poc/k8s/mock-servers/service.yaml
+  # for why an empty one here previously meant zero targets discovered.
+  labels:
+    app: statsd-exporter
+spec:
+  selector:
+    app: statsd-exporter
+  ports:
+    # statsd_exporter listens on both protocols on :9125 (see its own startup
+    # log: "Accepting StatsD Traffic udp=:9125 tcp=:9125") -- RLS's gostats
+    # client dials over TCP by default, confirmed via "statsd connection
+    # error: dial tcp ...:9125" once this was UDP-only.
+    - name: statsd-udp
+      port: 9125
+      targetPort: 9125
+      protocol: UDP
+    - name: statsd-tcp
+      port: 9125
+      targetPort: 9125
+      protocol: TCP
+    - name: metrics
+      port: 9102
+      targetPort: 9102
+      protocol: TCP

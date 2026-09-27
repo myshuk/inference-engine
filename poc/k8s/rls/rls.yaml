@@ -36,7 +36,11 @@ spec:
             - name: REDIS_URL
               value: valkey:6379
             - name: USE_STATSD
-              value: "false"
+              value: "true"
+            - name: STATSD_HOST
+              value: statsd-exporter
+            - name: STATSD_PORT
+              value: "9125"
             - name: LOG_LEVEL
               value: debug
           ports:

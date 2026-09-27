@@ -36,11 +36,14 @@ def kill_stray_port_forwards():
             pass
 
 
-def kubectl(*args, timeout=30):
+def kubectl(*args, timeout=30, input_text=None):
     """Run kubectl against the POC's kind context. Returns the CompletedProcess
-    (stdout/stderr as text); doesn't raise on non-zero exit -- callers assert."""
+    (stdout/stderr as text); doesn't raise on non-zero exit -- callers assert.
+    Pass input_text (e.g. with args ("apply", "-f", "-")) to pipe YAML via stdin
+    instead of applying from a file."""
     return subprocess.run(
         ["kubectl", "--context", KUBECTL_CONTEXT, *args],
+        input=input_text,
         capture_output=True,
         text=True,
         timeout=timeout,

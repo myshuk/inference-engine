@@ -66,3 +66,9 @@ def keycloak_port():
 def rls_grpc_port():
     with PortForward("identity-tenancy", "svc/rls", 8081, 8081) as pf:
         yield pf.local_port
+
+
+@pytest.fixture(scope="session")
+def prometheus_port():
+    with PortForward("monitoring", "svc/prometheus-kube-prometheus-prometheus", 9090, 9090) as pf:
+        yield pf.local_port

@@ -287,31 +287,99 @@ correction applied to the namespace itself).
      async (spawned, not awaited before the HTTP response returns) by polling briefly rather than
      assuming it's already landed.
 
-## Phase 4 — Band 6: GPU infrastructure (simulated, not real)
+## Phase 4 — Band 6: GPU infrastructure (simulated, not real) ✅ done
 
 Nothing here can run for real — no NVIDIA driver, no NVLink, no RDMA fabric. Thin stand-ins that still
 exercise the *scheduling logic*:
 
-1. **Kueue** — install for real (it's GPU-agnostic; gang-scheduling works against any quota-backed
-   resource). This is a genuine, working piece of the POC.
-2. **Fake GPU resource** — patch kind node `.status.capacity`/`.status.allocatable` to advertise a
-   fabricated `nvidia.com/gpu` extended resource (or run a fake device-plugin like
-   `kubevirt/device-plugin-fake`), so Kueue's gang-scheduling and resource-quota logic has something real
-   to schedule against.
+1. ✅ **Kueue** — installed for real via `poc/k8s/kueue-lab/` (umbrella chart, same pattern as
+   agentgateway/Keycloak — official chart at `oci://registry.k8s.io/kueue/charts`, pinned `0.19.4`, current
+   and actively maintained, no staleness concerns like RLS). It's GPU-agnostic; gang-scheduling works
+   against any quota-backed resource, so it installs and runs completely normally with zero GPU hardware.
+   Clean startup confirmed via logs — all 11 CRDs installed, internal cert management (no cert-manager
+   dependency needed) working, no errors.
+2. ✅ **Fake GPU resource** — patched `inference-poc-worker`'s node `.status.capacity`/`.status.allocatable`
+   directly via `kubectl patch --subresource=status` to advertise a fabricated `nvidia.com/gpu: 2`. Wired
+   up the real Kueue object chain against it (`poc/k8s/kueue-lab/fake-gpu-queue.yaml`): a `ResourceFlavor`
+   (our one fake-hardware category), a `ClusterQueue` (the actual quota: 2 GPUs, matching the fabricated
+   capacity), and a `LocalQueue` in a new `gpu-jobs` namespace (the namespace-scoped front door jobs
+   actually submit against). Used the current `kueue.x-k8s.io/v1beta2` API, not the deprecated `v1beta1`
+   the docs default to.
+   - **Verified real quota enforcement, not just that the objects report Ready** —
+     `poc/tests/test_10_kueue.py`: submits 3 plain `batch/job` Jobs (each requesting 1 fake GPU, labeled
+     `kueue.x-k8s.io/queue-name`) against the 2-GPU quota, confirms Kueue's own controller admits exactly 2
+     (flips `spec.suspend` to `false`) and holds the 3rd suspended — real gang-scheduling/admission logic,
+     no GPU hardware underneath. Polls briefly since admission is async; uses a unique job-name suffix per
+     run so a leftover job from an interrupted run can't eat into a later run's quota.
+   - **DRA (Dynamic Resource Allocation) explicitly not covered here, by design** — it's a different
+     Kubernetes resource model entirely (`resource.k8s.io` API: `DeviceClass`/`ResourceClaim`/`ResourceSlice`,
+     not the classic `.status.capacity` extended-resource model this phase uses) and needs a real or
+     simulated DRA *driver* publishing device inventory, not a simple node patch. Confirmed our cluster
+     already has the DRA API available (`resource.k8s.io/v1`, no feature-gate changes needed) and that
+     Kueue's own DRA integration is at beta as of `v0.19` (the version installed here) — so this would be a
+     real, valid extension if picked up later (`kubernetes-sigs/dra-example-driver` exists specifically for
+     hardware-free DRA testing), just deliberately out of scope for this pass.
 3. **GPU Operator, NCCL, DCGM, Network Operator** — cannot be installed (they require real NVIDIA
    drivers/hardware). Documented as explicitly out of scope for this POC rather than attempting a fake
    install.
 
-## Phase 5 — Control Plane D: observability
+## Phase 5 — Control Plane D: observability (Prometheus + Grafana done; KEDA deferred, stretch items deferred)
 
-1. `kube-prometheus-stack` Helm chart (Prometheus + Grafana) — standard on `kind`, scrapes the Band 5
-   engine's `/metrics` endpoint and RLS.
-2. KEDA — install, but scope expectations: since Band 5 replicas are host processes, not Pods, KEDA can't
-   actually scale them. Either point KEDA at a dummy in-cluster `Deployment` to prove the ScaledObject
-   mechanics, or defer KEDA to a later phase.
-3. Argo CD, OpenBao (dev-mode single container), Trivy (CLI scan step) are optional/stretch — they don't
-   affect whether a request flows correctly end-to-end. Falco is a probable skip: likely to fight
-   `kind`-on-Docker-Desktop's Linux VM eBPF/kernel compatibility.
+1. ✅ **`kube-prometheus-stack`** (Prometheus + Grafana only, scoped per explicit decision — KEDA deferred to
+   end of POC, item 3 below deferred, ask again later) — `poc/k8s/prometheus-lab/` (umbrella chart, same
+   pattern as agentgateway/Keycloak/Kueue, pinned `91.4.1`). Alertmanager disabled (no alerting use case
+   yet); `kubeControllerManager`/`kubeScheduler`/`kubeEtcd`/`kubeProxy` disabled (on `kind` these run as
+   static pods bound to `127.0.0.1` only, not reachable by ServiceMonitor-based scraping — a well-known
+   `kind` limitation, not a config bug); `kubeApiServer`/`kubelet`/`coreDns` left enabled since those *are*
+   reachable.
+   - **Real PVC added** (`storageSpec.volumeClaimTemplate`, 2Gi) — by default `Prometheus.spec.storage` is
+     unset, so the TSDB lives on ephemeral storage tied to the pod's lifecycle; the `retention: 10d` setting
+     is meaningless without this, since a pod restart (which happens on every `podman machine` pause/resume
+     in this project) would otherwise wipe all history. Confirmed `kind`'s `standard`/`rancher.io/local-path`
+     StorageClass already works (same as Postgres's own PVC) before adding this.
+   - **Two ServiceMonitors + a PodMonitor's replacement, not zero-config discovery** — left the Operator's
+     default `serviceMonitorSelectorNilUsesHelmValues: true` alone (declined to loosen cluster-wide
+     discovery) and labeled our own objects with `release: prometheus` instead, matching the Helm release.
+   - **Bug found and fixed: `vllm-mock-pool`'s ServiceMonitor matched zero targets.**
+     `poc/k8s/mock-servers/service.yaml`'s Service had no `metadata.labels` of its own — only
+     `spec.selector` (a different field, used for pod-matching). `ServiceMonitor.spec.selector` matches a
+     Service's own `metadata.labels`. Fixed by adding the missing label.
+   - **RLS has no `/metrics` endpoint at all** (confirmed `404`; only `/healthcheck` exists — `USE_STATSD`
+     was `false`, so its `gostats` metrics only ever went to stdout logs). Fixed by enabling
+     `USE_STATSD=true` and adding a `prom/statsd-exporter` sidecar (`poc/k8s/rls/statsd-exporter.yaml`) that
+     RLS's `gostats` client pushes to over statsd/**TCP** (its default transport, not UDP — the exporter
+     listens on both on the same port). Exposes a normal, unbroken Prometheus `/metrics` endpoint.
+   - **Real upstream bug found and worked around: agentgateway's `/metrics` rejects the entire scrape.**
+     agentgateway (`v1.5.0-beta.1`, confirmed still present on `main`) always encodes its metrics body with
+     the OpenMetrics-only encoder from its `prometheus_client` Rust dependency, but hardcodes the response
+     `Content-Type` header to classic `text/plain;charset=utf-8` whenever protobuf isn't requested.
+     OpenMetrics-only constructs (the `info` type, used by `agentgateway_build_info`) aren't legal under
+     that header's implied format, so Prometheus rejects the *entire* scrape — zero metrics, not just the
+     one bad line, including `agentgateway_gen_ai_client_token_usage` (the metric that proved criterion 4 in
+     Phase 2). Confirmed by reading `crates/agentgateway/src/management/metrics_server.rs` directly;
+     confirmed this isn't fixable from the Prometheus side (`PodMonitor.spec.fallbackScrapeProtocol` and
+     `scrapeProtocols` both tested empirically and don't apply — they only activate when Content-Type is
+     missing/unrecognized, not when it's valid-but-semantically-wrong, as it is here). No existing upstream
+     issue found. Worked around with `poc/k8s/agentgateway-metrics-relay/` — a small standalone relay
+     (can't patch a sidecar into agentgateway's own managed pod; the GatewayClass controller reverts that
+     within seconds) that fetches `:15020/metrics` verbatim and re-serves the identical bytes under the
+     corrected `application/openmetrics-text` Content-Type, which Prometheus's OpenMetrics parser already
+     fully supports.
+   - **Verified end-to-end, not just "pod is Running"** — `poc/tests/test_11_metrics.py`: confirms all three
+     new targets show `up` via Prometheus's own `/api/v1/targets`, and that real (non-placeholder) data is
+     queryable for each — the mocks' `vllm:kv_cache_usage_perc`, a live request's
+     `agentgateway_gen_ai_client_token_usage_sum` through the relay, and RLS's
+     `ratelimit_service_config_load_success` through statsd-exporter — plus that Prometheus's PVC is
+     actually `Bound`.
+   - **Loki/Tempo/OpenTelemetry tracing** (the wiki's own Control Plane D page mentions these; the original
+     plan above never itemized them) — skipped for now along with KEDA, per the same "ask again later"
+     decision; logs stay in `kubectl logs`/stdout as they have been throughout this POC.
+2. **KEDA** — deferred to the end of the POC (explicit decision). Scope note carried forward: since Band 5
+   replicas are host processes, not Pods, KEDA can't actually scale them — point it at a dummy in-cluster
+   `Deployment` to prove the `ScaledObject` mechanics instead.
+3. **Argo CD, OpenBao (dev-mode single container), Trivy (CLI scan step), Falco** — deferred, not decided
+   against; ask again later. They don't affect whether a request flows correctly end-to-end. Falco remains a
+   probable skip regardless: likely to fight `kind`-on-Docker-Desktop's Linux VM eBPF/kernel compatibility.
 
 ## Phase 6 — Control Plane A: billing (thin, shared infra as documented)
 
@@ -381,7 +449,7 @@ it before moving on, and pause for questions rather than batching multiple phase
 
 Everything verified manually via `curl`/`grpcurl`/port-forward throughout this project (see
 `exeReadme.md`) is also captured as a real, rerunnable `pytest` suite — one file per phase/component
-(`test_01_vllm.py` … `test_08_rls.py`), a shared `conftest.py` managing each service's port-forward
+(`test_01_vllm.py` … `test_11_metrics.py`), a shared `conftest.py` managing each service's port-forward
 lifecycle (starts once per session, blocks until the local port actually accepts connections, tears down
 at the end), and `helpers.py` for the `kubectl` wrapper. Each new component gets a new `test_NN_*.py` file
 here, and the whole suite gets rerun after any change — not just the newest piece — to catch regressions

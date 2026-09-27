@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentgateway-metrics-relay
+  labels:
+    app: agentgateway-metrics-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentgateway-metrics-relay
+  template:
+    metadata:
+      labels:
+        app: agentgateway-metrics-relay
+    spec:
+      containers:
+        - name: relay
+          image: python:3.12-slim
+          command: ["python3", "/app/relay.py"]
+          ports:
+            - name: metrics
+              containerPort: 9114
+          env:
+            - name: UPSTREAM_METRICS_URL
+              value: http://agentgateway-metrics-upstream:15020/metrics
+          volumeMounts:
+            - name: code
+              mountPath: /app
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: 9114
+            initialDelaySeconds: 2
+            periodSeconds: 5
+      volumes:
+        - name: code
+          configMap:
+            name: agentgateway-metrics-relay-code
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentgateway-metrics-relay
+  # Own object's labels -- needed for the Prometheus ServiceMonitor to match
+  # it (spec.selector below is a different field, used for pod-matching).
+  labels:
+    app: agentgateway-metrics-relay
+spec:
+  selector:
+    app: agentgateway-metrics-relay
+  ports:
+    - name: metrics
+      port: 9114
+      targetPort: 9114

@@ -1,0 +1,11 @@
+apiVersion: v2
+name: prometheus-lab
+description: Umbrella chart pinning kube-prometheus-stack (Control Plane D, Prometheus + Grafana only) for this POC
+version: 0.1.0
+
+# Same pattern as the other -lab charts -- pin + override only, no vendored
+# source. Official prometheus-community chart, actively maintained.
+dependencies:
+  - name: kube-prometheus-stack
+    version: 91.4.1
+    repository: https://prometheus-community.github.io/helm-charts
