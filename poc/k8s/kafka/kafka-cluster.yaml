@@ -1,0 +1,64 @@
+# Single-node, dual-role (broker+controller) KRaft cluster -- adapted from
+# Strimzi's own examples/kafka/kafka-single-node.yaml (1.2.0 tag), just with
+# a smaller PVC (100Gi -> 5Gi, this is a POC on a laptop, not production) and
+# names matching this project's convention. Matches the wiki's own call for
+# "single-node Kafka in KRaft mode, no ZooKeeper".
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: dual-role
+  labels:
+    strimzi.io/cluster: kafka
+spec:
+  replicas: 1
+  roles:
+    - controller
+    - broker
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 5Gi
+        kraftMetadata: shared
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: kafka
+spec:
+  kafka:
+    version: 4.3.1
+    metadataVersion: 4.3-IV0
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+    config:
+      offsets.topic.replication.factor: 1
+      transaction.state.log.replication.factor: 1
+      transaction.state.log.min.isr: 1
+      default.replication.factor: 1
+      min.insync.replicas: 1
+  entityOperator:
+    topicOperator: {}
+    userOperator: {}
+---
+# The billing record-of-truth topic (Non-Negotiable Constraints -- bill from
+# usage events, never from Valkey's lossy rate-limit counters). Single
+# partition/replica: this is a single-node POC cluster, not a durability
+# demo.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: usage-events
+  labels:
+    strimzi.io/cluster: kafka
+spec:
+  partitions: 1
+  replicas: 1

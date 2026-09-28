@@ -1203,3 +1203,383 @@ curl -s 'http://localhost:9090/api/v1/query?query=ratelimit_service_config_load_
 pytest -v
 # Result: 30 passed, 4 skipped (vLLM not running) -- test_11's 5 new tests all pass, zero regressions
 ```
+
+## Phase 6 — Control Plane A: billing
+
+Scoped up front: build Kafka + ClickHouse + OpenMeter + the collector-boundary decision now; Stripe test
+mode explicitly skipped (not required by acceptance criterion 5, which only asks for the event-capture
+pipeline); collector boundary = agentgateway -> OTel Collector -> Kafka (the plan's own recommendation).
+
+Folder convention changed this phase: no more `-lab` suffix on new component folders (`poc/k8s/kafka/`,
+`clickhouse/`, `otel/`, `openmeter/`, not `kafka-lab/` etc.) -- existing `-lab` folders to be renamed later,
+not part of this phase.
+
+### Kafka (Strimzi Operator, KRaft mode)
+
+```bash
+helm repo add strimzi https://strimzi.io/charts/
+helm search repo strimzi/strimzi-kafka-operator --versions
+# Result: 1.2.0 latest -- ZooKeeper support removed as of 0.46+, this pin is KRaft-only by necessity
+```
+
+`poc/k8s/kafka/Chart.yaml` -- dependency `strimzi-kafka-operator` 1.2.0.
+
+```bash
+cd poc/k8s/kafka && helm dependency update
+kubectl --context kind-inference-poc create namespace billing
+helm --kube-context kind-inference-poc install kafka-operator . -n billing
+kubectl --context kind-inference-poc -n billing get pods
+# Result: strimzi-cluster-operator Running
+```
+
+`poc/k8s/kafka/kafka-cluster.yaml` -- adapted from Strimzi's own `examples/kafka/kafka-single-node.yaml`
+(fetched via `gh api repos/strimzi/strimzi-kafka-operator/contents/examples/kafka/kafka-single-node.yaml?ref=1.2.0`),
+single dual-role (broker+controller) `KafkaNodePool`, PVC size dropped 100Gi -> 5Gi, plus a `usage-events`
+`KafkaTopic` for an initial smoke test.
+
+```bash
+kubectl --context kind-inference-poc -n billing apply -f poc/k8s/kafka/kafka-cluster.yaml
+kubectl --context kind-inference-poc -n billing wait --for=condition=Ready kafka/kafka --timeout=180s
+# Result: Ready. usage-events topic Ready too.
+
+# Real produce/consume smoke test, not just trusting Ready status:
+kubectl --context kind-inference-poc -n billing exec -i kafka-dual-role-0 -c kafka -- bash -c \
+  "echo 'hello-from-phase-6' | bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic usage-events"
+kubectl --context kind-inference-poc -n billing exec kafka-dual-role-0 -c kafka -- \
+  bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic usage-events --from-beginning --max-messages 1 --timeout-ms 10000
+# Result: "hello-from-phase-6" round-tripped correctly
+```
+
+### ClickHouse (Altinity Operator)
+
+```bash
+helm repo add altinity https://helm.altinity.com
+helm search repo altinity
+# Result: altinity/clickhouse 0.3.13 -- bundles the Altinity Operator as a dependency AND creates the
+# actual ClickHouseInstallation CR (one chart, not two) -- same operator OpenMeter's own bundled dev-mode
+# setup uses internally (confirmed later via its chart values), so a proven-compatible pairing.
+```
+
+`poc/k8s/clickhouse/Chart.yaml` + `values.yaml` -- `replicasCount`/`shardsCount` already default to 1/1;
+`persistence.size` dropped 10Gi -> 2Gi; `defaultUser.password: clickhouse-poc-only`.
+
+```bash
+cd poc/k8s/clickhouse && helm dependency update
+helm --kube-context kind-inference-poc install clickhouse . -n billing
+kubectl --context kind-inference-poc -n billing get chi
+# Result: Completed, 1 cluster, 1 host
+
+# Real query test, not just trusting Completed status:
+kubectl --context kind-inference-poc -n billing exec chi-clickhouse-clickhouse-0-0-0 -- \
+  clickhouse-client --user default --password clickhouse-poc-only --query "SELECT version(), 1+1"
+# Result: 25.3.6.10034.altinitystable  2 -- real query works
+```
+
+### OTel Collector -- researching agentgateway's real OTLP shape before wiring blind
+
+Checked whether Prometheus-scraping (already working from Phase 5) could double as the billing-event
+source -- rejected: a scraped cumulative counter/histogram has no per-request granularity, and the wiki's
+own design wants one event per request. Needed a genuine per-request signal (trace/log), not a metric.
+
+```bash
+# agentgateway's own reference OTel-stack architecture (agentgateway.dev/docs/kubernetes/latest/observability/otel-stack/):
+# access-logs AgentgatewayPolicy -> OTel logs collector -> Loki; tracing AgentgatewayPolicy -> OTel traces
+# collector -> Tempo. Confirmed token usage appears in agentgateway's structured access logs with real
+# token fields (schema/cel.md, fetched via gh api):
+gh api repos/agentgateway/agentgateway/contents/schema/cel.md --jq '.content' | base64 -d > /tmp/agentgateway-cel.md
+grep -n '^|`llm\.' /tmp/agentgateway-cel.md
+# Result: llm.inputTokens, llm.outputTokens, llm.totalTokens, llm.requestModel, llm.provider, llm.cost.total
+# (a full pre-computed USD cost catalog even), etc. -- no requestId/traceId field under `llm.` at all.
+```
+
+`poc/k8s/otel/Chart.yaml` -- dependency `open-telemetry/opentelemetry-collector` 0.173.1.
+`poc/k8s/otel/values.yaml` -- `image.repository: otel/opentelemetry-collector-contrib` (the plain/core
+image doesn't include the Kafka exporter needed downstream), tag `0.160.0` (matches this chart's own
+default appVersion). Used `alternateConfig`, not `config` -- the chart's own values.yaml documents a real
+Helm bug (helm/helm#12879) where `config` only partially merges with chart defaults when used as a
+subchart (our case), silently mangling array-valued keys like `service.pipelines.logs.processors`.
+
+```bash
+cd poc/k8s/otel && helm dependency update
+helm --kube-context kind-inference-poc install otel . -n billing
+# Result: 1/1 Running, debug-only pipeline (verification step, not the final config)
+```
+
+`poc/k8s/otel/access-log-policy.yaml` -- `AgentgatewayPolicy` targeting the `inference-gateway` Gateway,
+using `url:` (not `backendRef:`) to avoid a cross-namespace `ReferenceGrant` for this verification pass.
+
+```bash
+kubectl --context kind-inference-poc apply -f poc/k8s/otel/access-log-policy.yaml
+# Real request through the existing gateway/mock pipeline, then read the Collector's debug-exporter output:
+kubectl --context kind-inference-poc -n inference-poc port-forward svc/inference-gateway 18080:80 &
+curl -s -X POST http://localhost:18080/v1/chat/completions -H "x-api-key: pytest-otel-verify-1" \
+  -H "Content-Type: application/json" -d '{"model":"mock","messages":[{"role":"user","content":"..."}],"max_tokens":42}'
+kubectl --context kind-inference-poc -n billing logs deploy/otel-opentelemetry-collector --tail=100
+# Result: real LogRecord with gen_ai.usage.input_tokens=6/output_tokens=4 (matching actual usage.total_tokens
+# in the HTTP response) AND agentgateway's own default GenAI semantic-convention attributes already present
+# -- but Trace ID/Span ID both EMPTY. No incoming traceparent header, and randomSampling defaults to
+# disabled, so agentgateway never initiates a trace on its own.
+```
+
+Added `frontend.tracing` (same policy object) with `randomSampling: "1.0"` to force-sample every request --
+without this there's no free per-request unique identifier at all for the event's `id`.
+
+```bash
+# Re-tested: Trace ID/Span ID now populated (also duplicated as trace.id/span.id log attributes).
+# Also tested apiKey.key.unredacted() for "subject" -- came back empty. This project's auth is a custom
+# RLS check (poc/k8s/rls/agentgateway-policy.yaml), not agentgateway's built-in API-key-policy CEL context.
+# Switched to request.headers['x-api-key'] directly -- populated correctly on retest.
+```
+
+### Transform: agentgateway's access log -> CloudEvents JSON -> Kafka
+
+```bash
+gh api repos/open-telemetry/opentelemetry-collector-contrib/contents/exporter/kafkaexporter/README.md \
+  --jq '.content' | base64 -d > /tmp/kafkaexporter-readme.md
+# Result: `raw` encoding -- non-byte-array log body gets JSON-serialized as-is, no manual string-building
+# needed for the outer envelope.
+```
+
+First attempt used `context: log` (Advanced Config) with bare `attributes[...]` paths, assuming the context
+key drops the need for a `log.` prefix -- wrong. Confirmed via the transform processor's own README
+("Context inference" section): the `log.` prefix is what determines the context, always required
+regardless of which config style is used.
+
+Nested map literals (`data: {...}` inside the outer envelope `{...}`) hit a real, open OTTL bug
+(open-telemetry/opentelemetry-collector-contrib#37405, map literals nested inside other literals). Worked
+around by building two separate flat map literals and nesting via a `log.cache["envelope"]["data"] =
+log.cache["data"]` key-path assignment instead of literal nesting.
+
+```yaml
+# poc/k8s/otel/values.yaml -- transform/usage_events processor, log_statements (first version):
+- set(log.cache["data"], {"model": ..., "input_tokens": ..., ...}) where log.attributes["protocol"] == "llm"
+- set(log.cache["envelope"], {"specversion": "1.0", "id": log.attributes["trace.id"], ..., "time": FormatTime(log.observed_time, "%Y-%m-%dT%H:%M:%S.%fZ")}) where ...
+- set(log.cache["envelope"]["data"], log.cache["data"]) where ...
+- set(log.body, log.cache["envelope"]) where ...
+```
+
+```bash
+helm --kube-context kind-inference-poc upgrade otel . -n billing
+# Result: "cannot unmarshal the configuration: mapping values are not allowed in this context" -- YAML
+# parsed the unquoted {"key": value} colons as block-mapping syntax. Fixed by single-quoting each OTTL
+# statement as a YAML string.
+```
+
+Added `kafka/usage_events` exporter (`brokers`, `logs.topic: om_default_events`, `logs.encoding: raw`) and
+wired it into the logs pipeline alongside `debug`.
+
+```bash
+helm --kube-context kind-inference-poc upgrade otel . -n billing
+# Real request through the gateway again, then consume the topic directly:
+kubectl --context kind-inference-poc -n billing exec kafka-dual-role-0 -c kafka -- \
+  bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic om_default_events --from-beginning --max-messages 3 --timeout-ms 10000
+# Result: real CloudEvents-shaped JSON landed --
+# {"data":{"input_tokens":6,"model":"mock","output_tokens":4,"provider":"custom","total_tokens":10},
+#  "id":"d411ed4ba0b6b213f04ad49c28a9c8af","source":"agentgateway","specversion":"1.0",
+#  "subject":"customer-kafka-e2e-test","time":"2026-09-28T09:49:27.713985Z","type":"tokens_used"}
+# Matches the real response's usage exactly. Collector-boundary decision (criterion 5) verified end-to-end.
+```
+
+Swapped the debug-only pipeline for the real one, deleted the temporary `access-log-policy.yaml`
+verification comments (kept the policy itself, now load-bearing).
+
+### OpenMeter (self-hosted)
+
+```bash
+gh api "repos/openmeterio/openmeter/contents/config.example.yaml" --jq '.content' | base64 -d > /tmp/openmeter-config.example.yaml
+# ingest.kafka.eventsTopicTemplate default: "om_%s_events" -- %s = OpenMeter's own tenant "namespace"
+# concept (not k8s), confirmed default value "default" via app/config/namespace.go source. Topic name
+# above (om_default_events) wasn't a guess.
+```
+
+`poc/k8s/openmeter/Chart.yaml` -- dependency `oci://ghcr.io/openmeterio/helm-charts/openmeter`
+`1.0.0-beta.138` (latest available -- no stable `1.0` tag exists upstream yet, confirmed via the GHCR tags
+API directly since `helm search` doesn't work against OCI repos without a version).
+
+```bash
+# Dedicated Postgres db/user for OpenMeter, reusing the existing Phase-3 instance rather than a second one:
+POD=$(kubectl --context kind-inference-poc -n identity-tenancy get pods -l app=postgres -o jsonpath='{.items[0].metadata.name}')
+kubectl --context kind-inference-poc -n identity-tenancy exec "$POD" -- psql -U identity_tenancy -d identity_tenancy -c "CREATE DATABASE openmeter;"
+kubectl --context kind-inference-poc -n identity-tenancy exec "$POD" -- psql -U identity_tenancy -d identity_tenancy -c "CREATE USER openmeter WITH PASSWORD 'openmeter-poc-only';"
+kubectl --context kind-inference-poc -n identity-tenancy exec "$POD" -- psql -U identity_tenancy -d identity_tenancy -c "GRANT ALL PRIVILEGES ON DATABASE openmeter TO openmeter;"
+kubectl --context kind-inference-poc -n identity-tenancy exec "$POD" -- psql -U identity_tenancy -d identity_tenancy -c "ALTER DATABASE openmeter OWNER TO openmeter;"
+```
+
+`poc/k8s/openmeter/values.yaml` -- `kafka.enabled`/`clickhouse.enabled: false` (point at our own instead of
+the bundled dev pair), `config.postgres.url` (the new db/user above -- no bundled dev-mode toggle exists
+for Postgres at all in this chart), `config.aggregation.clickhouse.*` (native protocol, port 9000, not the
+8123 HTTP port), `config.sink.dedupe` (Redis driver, pointed at the existing Valkey rather than a new
+Redis, `database: 1` to avoid colliding with RLS's own keys on db 0).
+
+```bash
+cd poc/k8s/openmeter && helm dependency update
+helm --kube-context kind-inference-poc install openmeter . -n billing
+# Result: ServiceAccount "strimzi-cluster-operator" ... exists and cannot be imported -- kafka.enabled:
+# false alone isn't enough; the chart has a SEPARATE kafka.operator.install / clickhouse.operator.install
+# toggle that still tries installing its own Strimzi/Altinity operator release, colliding with ours.
+```
+
+Set `kafka.operator.install: false` / `clickhouse.operator.install: false` too, then hit a sequence of real
+issues, each fixed and re-verified:
+
+```bash
+# 1. panic: no meters configured -- needs at least one meter defined; added config.meters (slug
+#    tokens_total, eventType tokens_used, aggregation SUM, valueProperty $.total_tokens) matching the
+#    CloudEvents shape the OTel Collector transform produces.
+#
+# 2. ingest.kafka.broker still connecting to 127.0.0.1:29092 (bundled dev default) despite
+#    ingest.kafka.brokers being set -- wrong key name. Confirmed via source
+#    (app/config/ingest.go): v.SetDefault(prefixer("kafka.broker"), "127.0.0.1:29092") -- SINGULAR
+#    "broker", not plural "brokers". Both api and sink-worker share this same key.
+#
+# 3. ClickHouse "Authentication failed: password is incorrect, or there is no user with such name" --
+#    reproduced the identical error via direct clickhouse-client over the network (not localhost),
+#    confirmed the actual stored password via `kubectl get secret clickhouse-credentials` matched exactly
+#    what we set. Real cause: default/networks/ip: 127.0.0.1/32 on the CHI -- silently rejects any
+#    non-localhost connection with the SAME generic auth-failure message. Fixed via
+#    clickhouse.defaultUser.allowExternalAccess: true (poc/k8s/clickhouse/values.yaml).
+#
+# 4. Same auth error persisted even after the network fix -- turned out to be a SEPARATE issue:
+#    OpenMeter's client sends the target database as part of its initial connection handshake, and
+#    that database ("openmeter") didn't exist yet -- the combined (user, password, nonexistent-database)
+#    tuple gets rejected with the same generic code, not a distinct "unknown database" error like the
+#    CLI tool gives when switching database as a separate step. Fixed by creating the database directly:
+kubectl --context kind-inference-poc -n billing exec chi-clickhouse-clickhouse-0-0-0 -- \
+  clickhouse-client --user default --password clickhouse-poc-only --query "CREATE DATABASE IF NOT EXISTS openmeter"
+```
+
+```bash
+kubectl --context kind-inference-poc -n billing delete pod -l app.kubernetes.io/instance=openmeter
+kubectl --context kind-inference-poc -n billing logs deploy/openmeter-api --tail=10
+# Result: "default namespace created", "meters successfully created" -- both components genuinely healthy
+```
+
+### Real end-to-end test, and the sink-worker crash chain
+
+```bash
+# Real request through the gateway, then query OpenMeter's own meter API:
+curl -s "http://localhost:8888/api/v1/meters/tokens_total/query?subject=..."
+# Result: {"data": []} -- empty. Checked ClickHouse directly: om_events also empty.
+```
+
+Traced this through several distinct, real issues layered on top of each other (each confirmed via direct
+source reading at the exact deployed tag, `gh api ...?ref=v1.0.0-beta.138`, not "main" HEAD -- the running
+binary's actual logic repeatedly differed from "main"):
+
+```bash
+# Bug A: missing Kafka message HEADER. OpenMeter's sink-worker reads the tenant namespace from a Kafka
+# message header (kafkaingest.HeaderKeyNamespace = "namespace"), not the JSON body -- our raw kafkaexporter
+# writes no custom headers at all. Missing header -> message correctly marked to be dropped internally.
+#
+# Bug B: real upstream crash. dedupeSinkMessages at the deployed tag (internal/sink/sink.go:811) doesn't
+# check message processing state before dereferencing .Serialized.Id -- ANY dropped message in a flush
+# batch panics the whole sink-worker with a nil-pointer SIGSEGV, not just skips it. Confirmed fixed on
+# "main" (adds a switch on event.Status.State) but not backported to this beta tag.
+gh api "repos/openmeterio/openmeter/contents/internal/sink/sink.go?ref=v1.0.0-beta.138" --jq '.content' | base64 -d > /tmp/sink-real.go
+```
+
+Added `record_headers: [{name: namespace, value: default}]` to the kafka exporter (first attempt used a
+plain YAML map, which failed: `'record_headers' source data must be an array or slice, got map` --
+`RecordHeader` is `{name, value}` objects in a list, confirmed via the exporter's Go source).
+
+```bash
+helm --kube-context kind-inference-poc upgrade otel . -n billing
+# Real request -- crashed again, but this time confirmed genuinely processing (no race with a restart).
+gh api "repos/openmeterio/openmeter/contents/internal/ingest/kafkaingest/serializer/serializer.go?ref=v1.0.0-beta.138" \
+  --jq '.content' | base64 -d
+# Result: Bug C -- wire-schema mismatch. CloudEventsKafkaPayload requires `Time int64` (raw Unix seconds,
+# not RFC3339 string) and `Data string` (JSON-ENCODED STRING, not a nested object). Either mismatch fails
+# json.Unmarshal outright on the consumer side, hitting Bug B's same unguarded crash for a different reason.
+```
+
+Rewrote the transform: `UnixSeconds(log.observed_time)` for `time`; `data` built via a manually-escaped
+`Concat()` JSON string (OTTL has no map-to-JSON-string function) instead of a nested map -- this also
+collapsed the whole transform back to a single statement, since a string value doesn't hit the nested-map-
+literal OTTL bug from earlier.
+
+```bash
+# Bug D: poison-pill topic. Once malformed messages land, the consumer group never commits an offset past
+# them -- every restart replays from the beginning and crashes on the same first bad message again.
+kubectl --context kind-inference-poc -n billing exec kafka-dual-role-0 -c kafka -- \
+  bin/kafka-topics.sh --bootstrap-server localhost:9092 --delete --topic om_default_events
+# Also needed: restart the OTel Collector itself after topic delete+recreate -- its Kafka client caches
+# topic metadata by internal ID, and rejects the recreated topic (same name, new ID) with
+# "UNKNOWN_TOPIC_ID: This server does not host this topic ID.", not a name-based error.
+kubectl --context kind-inference-poc -n billing delete pod -l app.kubernetes.io/instance=otel
+kubectl --context kind-inference-poc -n billing delete pod -l app.kubernetes.io/instance=openmeter
+```
+
+```bash
+# Clean final test -- consumer subscribed and assigned BEFORE sending, no race:
+curl -s -X POST http://localhost:18080/v1/chat/completions -H "x-api-key: customer-openmeter-v2-fix" \
+  -H "Content-Type: application/json" -d '{"model":"mock","messages":[{"role":"user","content":"..."}],"max_tokens":42}'
+kubectl --context kind-inference-poc -n billing exec chi-clickhouse-clickhouse-0-0-0 -- \
+  clickhouse-client --user default --password clickhouse-poc-only --database openmeter \
+  --query "SELECT id, subject, type, data FROM om_events ORDER BY time DESC LIMIT 5 FORMAT Vertical"
+# Result: real row -- id, subject=customer-openmeter-v2-fix, type=tokens_used,
+# data={"model":"mock","provider":"custom","input_tokens":6,"output_tokens":4,"total_tokens":10}
+# Zero pod restarts.
+
+curl -s "http://localhost:8888/api/v1/meters/tokens_total/query?subject=customer-openmeter-v2-fix"
+# Result: {"data": [{"value": 10, "windowStart": "...", "windowEnd": "...", "subject": "customer-openmeter-v2-fix", "groupBy": {}}]}
+# value=10 matches the real response's total_tokens exactly. Full pipeline verified end-to-end:
+# agentgateway -> OTel Collector -> Kafka -> OpenMeter -> ClickHouse -> correct billable usage per customer.
+```
+
+### Event schema: adding event_version, and proving idempotency for real
+
+`poc/k8s/otel/values.yaml` -- added `"event_version":"1.0"` inside the `data` JSON string, not as a
+top-level envelope field. OpenMeter's `CloudEventsKafkaPayload` struct only has fixed fields
+(Id/Type/Source/Subject/Time/Data) -- an extra top-level key would just be silently discarded by
+`json.Unmarshal`, never stored anywhere.
+
+```bash
+helm --kube-context kind-inference-poc upgrade otel . -n billing
+# Real request, then check the stored data column:
+kubectl --context kind-inference-poc -n billing exec chi-clickhouse-clickhouse-0-0-0 -- \
+  clickhouse-client --user default --password clickhouse-poc-only --database openmeter \
+  --query "SELECT data FROM om_events WHERE subject='customer-version-check' ORDER BY time DESC LIMIT 1"
+# Result: {"event_version":"1.0","model":"mock","provider":"custom","input_tokens":6,"output_tokens":4,"total_tokens":10}
+```
+
+Manually verified the actual idempotency guarantee before writing it up as a test -- a real HTTP request
+can't produce two events sharing the same trace ID (every request gets a fresh one), so simulating
+redelivery means producing a raw Kafka message with a fixed `id` directly:
+
+```bash
+# kafka-console-producer's header syntax: --property parse.headers=true, format "h1:v1,...\tvalue"
+cat > /tmp/dedup-test-message.txt << 'EOF'
+namespace:default	{"specversion":"1.0","id":"dedup-test-manual-1","source":"agentgateway","type":"tokens_used","subject":"customer-dedup-manual","time":1790590000,"data":"{\"event_version\":\"1.0\",\"model\":\"mock\",\"provider\":\"custom\",\"input_tokens\":100,\"output_tokens\":50,\"total_tokens\":150}"}
+EOF
+# Produced the IDENTICAL message twice:
+kubectl --context kind-inference-poc -n billing exec -i kafka-dual-role-0 -c kafka -- bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic om_default_events --property parse.headers=true < /tmp/dedup-test-message.txt
+kubectl --context kind-inference-poc -n billing exec -i kafka-dual-role-0 -c kafka -- bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic om_default_events --property parse.headers=true < /tmp/dedup-test-message.txt
+
+kubectl --context kind-inference-poc -n billing exec chi-clickhouse-clickhouse-0-0-0 -- \
+  clickhouse-client --user default --password clickhouse-poc-only --database openmeter \
+  --query "SELECT count(*) FROM om_events WHERE id='dedup-test-manual-1'"
+# Result: 1 -- not 2. Real dedup confirmed, no crash.
+
+curl -s "http://localhost:8888/api/v1/meters/tokens_total/query?subject=customer-dedup-manual"
+# Result: {"data": [{"value": 150, ...}]} -- not 300. The redelivered duplicate never got double-counted
+# in the actual billing aggregate, not just deduped at the raw-events-table level.
+```
+
+### Captured as an automated test, not just manual curl+kubectl inspection
+
+```bash
+# poc/tests/conftest.py -- added openmeter_port fixture (svc/openmeter-api, 8888 -> 80)
+# poc/tests/test_12_billing.py --
+#   test_real_request_produces_a_correctly_aggregated_usage_event: real request through the gateway,
+#   polls OpenMeter's meter-query API, confirms the aggregated value equals the response's real total_tokens.
+#   test_redelivered_event_id_is_not_double_counted: produces a raw Kafka message (same wire schema as
+#   above) with a fixed id twice via kubectl exec + kafka-console-producer, confirms exactly 1 row in
+#   om_events and the meter aggregate reflects the value once, not twice.
+pytest -v
+# Result: 32 passed, 4 skipped (vLLM not running) -- test_12's 2 new tests both pass, zero regressions
+```
+
+Not built this phase: Stripe (explicitly skipped, not deferred -- see README.md item 4). Phase 6 is
+otherwise done.

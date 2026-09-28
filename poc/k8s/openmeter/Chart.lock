@@ -1,0 +1,6 @@
+dependencies:
+- name: openmeter
+  repository: oci://ghcr.io/openmeterio/helm-charts
+  version: 1.0.0-beta.138
+digest: sha256:ac9b70f08bb161fe09b808dabe7c16b638801e0c30110460968864dc95c88c7f
+generated: "2026-09-28T10:56:43.143004+01:00"

@@ -1,0 +1,13 @@
+apiVersion: v2
+name: kafka
+description: Umbrella chart pinning the Strimzi Kafka Operator (Control Plane A, billing event bus) for this POC
+version: 0.1.0
+
+# Same pattern as the other component charts -- pin + override only, no vendored source.
+# Strimzi is Apache 2.0, actively maintained. ZooKeeper support was removed as of
+# Strimzi 0.46+ -- this pin is KRaft-only, matching current upstream direction
+# (also what the wiki calls for: "single-node Kafka in KRaft mode, no ZooKeeper").
+dependencies:
+  - name: strimzi-kafka-operator
+    version: 1.2.0
+    repository: https://strimzi.io/charts/

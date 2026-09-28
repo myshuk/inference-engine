@@ -72,3 +72,9 @@ def rls_grpc_port():
 def prometheus_port():
     with PortForward("monitoring", "svc/prometheus-kube-prometheus-prometheus", 9090, 9090) as pf:
         yield pf.local_port
+
+
+@pytest.fixture(scope="session")
+def openmeter_port():
+    with PortForward("billing", "svc/openmeter-api", 8888, 80) as pf:
+        yield pf.local_port

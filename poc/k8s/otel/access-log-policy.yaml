@@ -1,0 +1,48 @@
+# STEP 1 verification only -- confirming what agentgateway's real OTLP access
+# log payload actually contains (exact llm.* attribute names from
+# schema/cel.md, whether a trace_id is present automatically on the log
+# record) before designing the Kafka exporter's transform. Using `url`
+# directly (not backendRef) since the Collector lives in a different
+# namespace (billing) than this Gateway (inference-poc) -- avoids needing a
+# ReferenceGrant for this quick verification pass.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: access-logs-to-otel
+  namespace: inference-poc
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: inference-gateway
+  frontend:
+    accessLog:
+      attributes:
+        add:
+          - name: llm.provider
+            expression: "llm.provider"
+          - name: llm.requestModel
+            expression: "llm.requestModel"
+          - name: llm.inputTokens
+            expression: "llm.inputTokens"
+          - name: llm.outputTokens
+            expression: "llm.outputTokens"
+          - name: llm.totalTokens
+            expression: "llm.totalTokens"
+          - name: subject
+            # apiKey.* (agentgateway's built-in API-key-policy CEL context) is
+            # empty here -- this project's auth is a custom RLS-based check
+            # (poc/k8s/rls/agentgateway-policy.yaml), not agentgateway's own
+            # built-in API key policy type. Read the raw header instead.
+            expression: "request.headers['x-api-key']"
+      otlp:
+        url: http://otel-opentelemetry-collector.billing.svc.cluster.local:4318
+        protocol: HTTP
+    # No incoming request has a trace already (no traceparent header from
+    # clients) -- randomSampling defaults to disabled, so without this,
+    # agentgateway never initiates a trace and Trace ID/Span ID stay empty
+    # even on the access log. Force-sample every request instead.
+    tracing:
+      randomSampling: "1.0"
+      url: http://otel-opentelemetry-collector.billing.svc.cluster.local:4318
+      protocol: HTTP

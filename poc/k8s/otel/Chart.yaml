@@ -1,0 +1,13 @@
+apiVersion: v2
+name: otel
+description: Umbrella chart pinning the OpenTelemetry Collector (Control Plane A, agentgateway access-logs -> Kafka boundary) for this POC
+version: 0.1.0
+
+# Same pattern as the other component charts -- pin + override only, no
+# vendored source. Official open-telemetry chart; image overridden to the
+# "contrib" distribution in values.yaml since the plain/core image doesn't
+# include the Kafka exporter we need downstream.
+dependencies:
+  - name: opentelemetry-collector
+    version: 0.173.1
+    repository: https://open-telemetry.github.io/opentelemetry-helm-charts

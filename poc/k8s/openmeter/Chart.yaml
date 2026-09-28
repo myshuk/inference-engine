@@ -1,0 +1,12 @@
+apiVersion: v2
+name: openmeter
+description: Umbrella chart pinning OpenMeter, self-hosted (Control Plane A, rating/billing domain logic) for this POC
+version: 0.1.0
+
+# Same pattern as the other component charts -- pin + override only, no
+# vendored source. Official OpenMeter chart, OCI registry. No stable 1.0 tag
+# exists upstream yet as of this pin -- still beta, latest available.
+dependencies:
+  - name: openmeter
+    version: 1.0.0-beta.138
+    repository: oci://ghcr.io/openmeterio/helm-charts

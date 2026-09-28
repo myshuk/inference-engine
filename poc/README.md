@@ -381,32 +381,90 @@ exercise the *scheduling logic*:
    against; ask again later. They don't affect whether a request flows correctly end-to-end. Falco remains a
    probable skip regardless: likely to fight `kind`-on-Docker-Desktop's Linux VM eBPF/kernel compatibility.
 
-## Phase 6 — Control Plane A: billing (thin, shared infra as documented)
+## Phase 6 — Control Plane A: billing (thin, shared infra as documented) — done except Stripe (skipped)
 
 Per the wiki's own principle (one Kafka topic, one ClickHouse cluster, not one pair per consumer):
 
-1. Single-node Kafka in KRaft mode (no ZooKeeper).
-2. Single-node ClickHouse.
-3. OpenMeter, self-hosted, configured to consume from the **same** Kafka topic/ClickHouse cluster rather
-   than its own bundled dev pair.
-4. Stripe in **test mode** (sandbox keys, no real charges) for the final rating→payment hop.
-5. **The collector-boundary decision (criterion 5).** agentgateway already emits OTel token-usage data
-   (Band 4's backend-policy stage) — the open question is *where that becomes a durable, billable event*.
-   Two candidates:
-   - **(a) agentgateway writes straight to the Kafka topic.** Fewer moving parts, but couples agentgateway
-     directly to Kafka's client/schema, and any batching/transform/retry logic has to live inside
-     agentgateway itself.
-   - **(b) an OpenTelemetry Collector sits between agentgateway and Kafka** (agentgateway → OTel Collector
-     → Kafka). agentgateway just emits OTel, same as its tracing path; the Collector owns
-     batching/transform/export and is where the versioning below actually gets stamped onto the event.
-     **Recommended** — it's the standard shape for "telemetry in, durable record out" and keeps
-     agentgateway's job (decide + emit) separate from the collector's job (transform + guarantee delivery).
-   - Pick one deliberately and document it here once built, rather than defaulting to (a) by inertia.
-6. **Event schema: versioned + idempotent.** Each usage event carries `event_version` (so the schema can
-   change without breaking old consumers) and `event_id` — derived from agentgateway's own per-request ID,
-   not freshly generated at the collector boundary — so a redelivered event is a no-op. Idempotency is
-   enforced at the ClickHouse/OpenMeter consumer side (dedupe on `event_id`, e.g. `ReplacingMergeTree`),
-   not by trying to guarantee exactly-once delivery upstream.
+1. ✅ **Single-node Kafka in KRaft mode** — `poc/k8s/kafka/` (Strimzi Operator `1.2.0`, Apache 2.0,
+   ZooKeeper support removed as of Strimzi `0.46+` so this pin is KRaft-only by necessity, matching the
+   plan). Dual-role (broker+controller) single `KafkaNodePool`, adapted from Strimzi's own
+   `examples/kafka/kafka-single-node.yaml`. Verified with a real produce/consume round-trip, not just
+   `Ready` status.
+2. ✅ **Single-node ClickHouse** — `poc/k8s/clickhouse/` (Altinity's `clickhouse` chart `0.3.13`, bundles
+   the Altinity Operator as a dependency — the same operator OpenMeter's own bundled dev-mode setup uses
+   internally, confirmed via its chart values, so this is a proven-compatible pairing). `allowExternalAccess:
+   true` required on the default user — its default `hostIP: 127.0.0.1/32` restriction rejects any other
+   pod's connection with a generic "Authentication failed" error that's indistinguishable from a genuinely
+   wrong password until you check `default/networks/ip` on the live `ClickHouseInstallation`.
+3. ✅ **OpenMeter, self-hosted, consuming from the same Kafka/ClickHouse** — `poc/k8s/openmeter/` (official
+   chart, `oci://ghcr.io/openmeterio/helm-charts/openmeter`, `1.0.0-beta.138` — no stable `1.0` tag exists
+   upstream yet). `kafka.enabled`/`clickhouse.enabled: false` alone isn't enough — the chart has a *separate*
+   `kafka.operator.install`/`clickhouse.operator.install` toggle that still tries installing its own
+   Strimzi/Altinity operator release, colliding with ours; both must be disabled too. Postgres has no
+   bundled dev-mode toggle at all (always external) — reused the existing Phase-3 Postgres instance with a
+   dedicated `openmeter` database/user rather than standing up a second Postgres. Sink dedup (Redis) reused
+   the existing Valkey (`poc/k8s/valkey/`) on a separate DB index (`1`, vs RLS's default `0`) rather than
+   deploying a redundant Redis.
+4. **Stripe in test mode — explicitly skipped, not deferred.** Not required by acceptance criterion 5 (which
+   only asks for the event-capture pipeline, not an actual payment action) — a genuine scope decision, not
+   an oversight.
+5. ✅ **The collector-boundary decision (criterion 5) — chose (b), OTel Collector.**
+   `agentgateway → OTel Collector → Kafka`, matching the plan's own recommendation. `poc/k8s/otel/`
+   (official `open-telemetry/opentelemetry-collector` chart `0.173.1`, `image.repository` overridden to the
+   `contrib` distribution — the Kafka exporter only ships there). Wired via a new
+   `AgentgatewayPolicy` (`poc/k8s/otel/access-log-policy.yaml`) with both `frontend.accessLog` (the actual
+   per-request token-usage data — agentgateway already emits it under the standard OTel GenAI semantic
+   convention attributes, e.g. `gen_ai.usage.input_tokens`, no custom instrumentation needed) and
+   `frontend.tracing` with `randomSampling: "1.0"` (without a `tracing` policy, `Trace ID`/`Span ID` on the
+   access log stay empty — there's no free per-request identifier otherwise, and this project's actual auth
+   is a custom RLS check rather than agentgateway's built-in API-key-policy CEL context, so `subject` comes
+   from `request.headers['x-api-key']` directly instead of the unpopulated `apiKey.*` namespace).
+6. ✅ **Event schema: versioned + idempotent.** `id` is agentgateway's own per-request trace ID (from the
+   `tracing` policy above), not freshly generated at the collector boundary. `event_version` lives inside
+   `data` (`poc/k8s/otel/values.yaml`'s transform), not as a top-level envelope field — OpenMeter's
+   `CloudEventsKafkaPayload` struct only has fixed fields, so an extra top-level key would just be silently
+   discarded by `json.Unmarshal`. Idempotency is **not** `ReplacingMergeTree`-based dedup as originally
+   planned — real OpenMeter architecture: the sink-worker dedupes via **Redis**
+   (`sink.dedupe.driver: redis`, optional — degrades to a logged warning if unset, not a hard failure)
+   *before* the ClickHouse insert, keyed on `(namespace, id, source)`; `om_events` itself uses a plain
+   `MergeTree`. Wired to the existing Valkey per item 3 above.
+   - **Verified for real, not just "Redis is configured"** — `poc/tests/test_12_billing.py`: produces a raw
+     Kafka message with a fixed `id` twice (simulating at-least-once redelivery, which a real HTTP request
+     can't do since every request gets a fresh trace ID) and confirms exactly one row lands in `om_events`
+     and the meter aggregate reflects the value once, not twice. A second test confirms a real request's
+     token usage becomes a correctly-aggregated, queryable billing number end to end.
+
+### Real bugs found and fixed getting the OTel Collector → Kafka → OpenMeter path working
+
+- **Missing Kafka message header.** OpenMeter's sink-worker expects the tenant namespace as a Kafka message
+  *header* (`kafkaingest.HeaderKeyNamespace = "namespace"`, confirmed via source), not a JSON body field.
+  Without it every message is correctly marked to be dropped internally — but see the next bug.
+- **Real upstream bug in the pinned OpenMeter beta (`v1.0.0-beta.138`).** Its `dedupeSinkMessages` doesn't
+  check a message's processing state before dereferencing a field (`.Serialized.Id`) that's only populated
+  on successfully-parsed messages — so *any* dropped/invalid message in a flush batch crashes the whole
+  sink-worker with a nil-pointer panic, instead of just being skipped. Confirmed fixed in later versions by
+  reading `main`, but not backported to this tag. Combined with the missing header above, this meant every
+  single test message crashed the consumer until the header was added.
+- **Wire-schema mismatch, not just "malformed JSON."** OpenMeter's actual Kafka payload struct
+  (`CloudEventsKafkaPayload`) requires `time` as a raw Unix-seconds **integer** (`json:"time"` into an
+  `int64`), not an RFC3339 string, and `data` as a JSON-**encoded string** (`json:"data"` into a `string`),
+  not a nested object — get either wrong and the message fails to `json.Unmarshal` at all on the consumer
+  side, hitting the same crash above for a different reason. Fixed via OTTL's `UnixSeconds()` and a
+  manually-escaped `Concat()`-built JSON string (OTTL has no map-to-JSON-string function).
+- **Poison-pill topic.** Once malformed messages land, the consumer group never commits past them, so every
+  restart replays from the beginning and crashes again on the same first bad message — deleting and
+  recreating the topic was required after each real fix (a Kafka client with cached topic metadata from
+  before a delete+recreate also needs its own restart — it rejects the recreated topic by its new internal
+  ID with `UNKNOWN_TOPIC_ID`, not a name mismatch).
+
+**Verified end-to-end, not just "the pipe is connected"** — `poc/tests/test_12_billing.py`: a real request
+through the gateway produces a row in `om_events` with the correct
+`{model, provider, input_tokens, output_tokens, total_tokens}`, **and** OpenMeter's own meter-query API
+(`/api/v1/meters/tokens_total/query`) returns the correct aggregated `value` for that specific customer —
+plus the redelivery/idempotency proof described in item 6 above.
+
+Not built this phase: Stripe (explicitly skipped, not deferred — see item 4). The developer portal itself
+(signup, key management, usage dashboards) is separately out of scope for this POC's acceptance criteria.
 
 ## Phase 7 — Control Plane C: model registry (stubbed, symbolic)
 
@@ -449,7 +507,7 @@ it before moving on, and pause for questions rather than batching multiple phase
 
 Everything verified manually via `curl`/`grpcurl`/port-forward throughout this project (see
 `exeReadme.md`) is also captured as a real, rerunnable `pytest` suite — one file per phase/component
-(`test_01_vllm.py` … `test_11_metrics.py`), a shared `conftest.py` managing each service's port-forward
+(`test_01_vllm.py` … `test_12_billing.py`), a shared `conftest.py` managing each service's port-forward
 lifecycle (starts once per session, blocks until the local port actually accepts connections, tears down
 at the end), and `helpers.py` for the `kubectl` wrapper. Each new component gets a new `test_NN_*.py` file
 here, and the whole suite gets rerun after any change — not just the newest piece — to catch regressions

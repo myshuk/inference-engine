@@ -1,0 +1,73 @@
+# Overrides for the openmeter subchart, pinned in Chart.yaml.
+#
+# kafka.enabled/clickhouse.enabled: false -- the chart's bundled dev-mode
+# pair (also Strimzi + Altinity under the hood, confirmed via its own
+# values.yaml comments -- same operators we already deployed ourselves) is
+# "not recommended for production" per the chart's own docs. Point at our
+# own poc/k8s/kafka + poc/k8s/clickhouse instead, matching this project's
+# "one Kafka topic, one ClickHouse cluster, not one pair per consumer"
+# principle from the wiki.
+#
+# Postgres: no bundled dev-mode toggle exists in this chart at all -- always
+# external, via config.postgres.url. Reused the existing Phase-3 Postgres
+# instance (poc/k8s/postgres/) with a new dedicated database/user, rather
+# than standing up a second Postgres just for this.
+#
+# Redis (sink dedupe): reused the existing Valkey (poc/k8s/valkey/,
+# identity-tenancy namespace) instead of deploying a new Redis -- Valkey is
+# wire-compatible, and OpenMeter's own dedup driver is generically "redis".
+# Using database: 1 to keep OpenMeter's dedup keys out of RLS's own
+# rate-limit-counter keyspace (RLS uses the default db 0).
+openmeter:
+  kafka:
+    enabled: false
+    operator:
+      install: false   # separate toggle from `enabled` -- otherwise still
+                        # tries installing its own Strimzi operator, colliding
+                        # with poc/k8s/kafka/'s own release
+  clickhouse:
+    enabled: false
+    operator:
+      install: false   # same as above, for the Altinity operator
+
+  config:
+    postgres:
+      url: postgres://openmeter:openmeter-poc-only@postgres.identity-tenancy.svc.cluster.local:5432/openmeter?sslmode=disable
+      autoMigrate: migration
+
+    ingest:
+      kafka:
+        # Singular "broker" (confirmed via app/config/ingest.go source) --
+        # both the api server (producer) and sink-worker (consumer) read
+        # this same key. Plural "brokers" is silently ignored, and both
+        # components fall back to the bundled dev-mode default
+        # (127.0.0.1:29092) without erroring -- confirmed the hard way via
+        # their logs before finding this.
+        broker: kafka-kafka-bootstrap.billing.svc.cluster.local:9092
+
+    aggregation:
+      clickhouse:
+        address: clickhouse-clickhouse.billing.svc.cluster.local:9000
+        database: openmeter
+        username: default
+        password: clickhouse-poc-only
+
+    sink:
+      dedupe:
+        enabled: true
+        driver: redis
+        config:
+          address: valkey.identity-tenancy.svc.cluster.local:6379
+          database: 1
+
+    # Matches the CloudEvents shape poc/k8s/otel/values.yaml's transform
+    # produces: type "tokens_used", data.total_tokens/model/provider.
+    meters:
+      - slug: tokens_total
+        description: LLM token usage per request
+        eventType: tokens_used
+        aggregation: SUM
+        valueProperty: $.total_tokens
+        groupBy:
+          model: $.model
+          provider: $.provider

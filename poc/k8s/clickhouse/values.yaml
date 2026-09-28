@@ -1,0 +1,18 @@
+# Overrides for the altinity/clickhouse subchart, pinned in Chart.yaml.
+# replicasCount/shardsCount already default to 1/1 (single-node, matches
+# this POC's scale) -- nothing to override there.
+clickhouse:
+  clickhouse:
+    defaultUser:
+      password: clickhouse-poc-only
+      # Default hostIP restricts the "default" user to 127.0.0.1/32 --
+      # rejects any other pod's connection (OpenMeter included) with a
+      # generic "Authentication failed" error that's indistinguishable from
+      # a genuinely wrong password until you check `default/networks/ip` on
+      # the live CHI resource. Needed for any other in-cluster consumer.
+      allowExternalAccess: true
+    persistence:
+      enabled: true
+      size: 2Gi   # default 10Gi -- this is a POC on a laptop, not production
+      # storageClass left unset -- "standard" is kind's cluster default
+      # (same provisioner already proven working for Postgres/Prometheus).

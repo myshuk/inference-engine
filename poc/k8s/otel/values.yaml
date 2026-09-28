@@ -1,0 +1,131 @@
+# Overrides for the opentelemetry-collector subchart, pinned in Chart.yaml.
+#
+# image.repository must be the "contrib" distribution, not the default/core
+# one -- the Kafka exporter we need downstream only ships in contrib.
+# Pinned 0.160.0 to match this chart version's own default appVersion.
+#
+# Using alternateConfig, not config: the chart's own values.yaml documents a
+# real Helm bug (helm/helm#12879) where `config` only partially merges with
+# chart defaults when used as a subchart (our case, via Chart.yaml) --
+# array-valued keys like service.pipelines.logs.processors get silently
+# replaced in confusing ways. alternateConfig is a full, self-contained
+# replacement instead, recommended by the chart itself for subchart use.
+#
+# Pipeline: agentgateway's OTLP access-log push (poc/k8s/otel/access-log-
+# policy.yaml) -> transform (reshape into a CloudEvents envelope OpenMeter's
+# sink-worker expects) -> kafka exporter (raw encoding: a non-byte-array log
+# body gets JSON-serialized as-is, so no manual string-building needed).
+#
+# The transform builds the CloudEvents "data" object and the outer envelope
+# as two SEPARATE map literals (not one literal nested inside another) --
+# OTTL has a known open bug with map literals nested inside other literals
+# in a single expression (open-telemetry/opentelemetry-collector-contrib#37405).
+# Building them as two statements and nesting via a key-path assignment
+# instead sidesteps it. Verified empirically end-to-end -- see
+# poc/exeReadme.md for the real request -> real Kafka message trace.
+#
+# Field mapping (all confirmed against a real request, not guessed):
+#   id       <- trace.id           (agentgateway's own per-request trace ID --
+#                                    only present because a `tracing` policy
+#                                    with randomSampling forces one; without
+#                                    it Trace ID/Span ID are empty)
+#   subject  <- request.headers['x-api-key'] (this project's actual auth is a
+#                                    custom RLS check, not agentgateway's
+#                                    built-in API-key-policy CEL context,
+#                                    which is empty here)
+#   data.*   <- gen_ai.* / llm.*    (both present by default once accessLog is
+#                                    enabled; llm.* attributes added explicitly
+#                                    in access-log-policy.yaml for clarity)
+opentelemetry-collector:
+  mode: deployment
+  image:
+    repository: otel/opentelemetry-collector-contrib
+    tag: "0.160.0"
+  alternateConfig:
+    extensions:
+      health_check:
+        endpoint: ${env:MY_POD_IP}:13133
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: ${env:MY_POD_IP}:4317
+          http:
+            endpoint: ${env:MY_POD_IP}:4318
+    processors:
+      batch: {}
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 80
+        spike_limit_percentage: 25
+      transform/usage_events:
+        error_mode: ignore
+        # OpenMeter's Kafka wire schema (internal/ingest/kafkaingest/
+        # serializer.CloudEventsKafkaPayload, confirmed by reading the source
+        # at our exact pinned tag) is stricter than plain CloudEvents JSON:
+        # "time" must be a raw Unix-seconds integer (json.Unmarshal into an
+        # int64 field), not an RFC3339 string, and "data" must be a
+        # JSON-ENCODED STRING (json.Unmarshal into a string field), not a
+        # nested object. Getting either wrong makes the whole Kafka message
+        # fail to json.Unmarshal on the consumer side -- which, combined
+        # with a real bug in this specific OpenMeter beta (its dedupe step
+        # doesn't check message state before dereferencing a field that's
+        # only set on successfully-parsed messages), crashes the sink-worker
+        # outright instead of just dropping the one bad message.
+        #
+        # "data" is built as a manually-escaped JSON string via Concat
+        # rather than a nested map literal -- OTTL has no map-to-JSON-string
+        # function, and this doubles as a way to avoid ever nesting one map
+        # literal inside another (a separate, real OTTL parser limitation --
+        # open-telemetry/opentelemetry-collector-contrib#37405).
+        #
+        # event_version lives inside "data", not as a top-level envelope
+        # field -- OpenMeter's CloudEventsKafkaPayload struct only has
+        # fixed fields (Id/Type/Source/Subject/Time/Data); an extra
+        # top-level key would just be silently discarded by
+        # json.Unmarshal. "id" (agentgateway's own trace ID) is what makes
+        # redelivery a no-op -- OpenMeter's sink-worker dedupes on
+        # (namespace, id, source) via Redis before the ClickHouse insert.
+        log_statements:
+          - 'set(log.body, {"specversion": "1.0", "id": log.attributes["trace.id"], "source": "agentgateway", "type": "tokens_used", "subject": log.attributes["subject"], "time": UnixSeconds(log.observed_time), "data": Concat(["{\"event_version\":\"1.0\",\"model\":\"", log.attributes["gen_ai.request.model"], "\",\"provider\":\"", log.attributes["gen_ai.provider.name"], "\",\"input_tokens\":", log.attributes["gen_ai.usage.input_tokens"], ",\"output_tokens\":", log.attributes["gen_ai.usage.output_tokens"], ",\"total_tokens\":", log.attributes["llm.totalTokens"], "}"], "")}) where log.attributes["protocol"] == "llm"'
+    exporters:
+      debug:
+        verbosity: detailed
+      kafka/usage_events:
+        brokers:
+          - kafka-kafka-bootstrap.billing.svc.cluster.local:9092
+        # OpenMeter's sink-worker looks for the tenant namespace as a Kafka
+        # message HEADER (kafkaingest.HeaderKeyNamespace = "namespace"), not
+        # a field in the JSON body -- without it, every message gets
+        # correctly marked DROP internally, but the specific OpenMeter beta
+        # we're pinned to (v1.0.0-beta.138) has a real bug where its dedup
+        # step doesn't check message state before dereferencing a field that
+        # only exists on non-dropped messages, so a missing header here
+        # crashes the whole sink-worker instead of just dropping the one
+        # message. Confirmed via reading openmeter/sink/sink.go at that
+        # exact tag -- fixed in later versions, but this is also just a
+        # genuinely required header we were missing, not only a workaround.
+        # "default" is OpenMeter's own tenant-namespace concept (not a k8s
+        # namespace) -- matches namespace.default's own config default and
+        # the om_default_events topic name (om_%s_events templated on it).
+        record_headers:
+          - name: namespace
+            value: default
+        logs:
+          topic: om_default_events
+          encoding: raw
+    service:
+      extensions: [health_check]
+      pipelines:
+        logs:
+          receivers: [otlp]
+          processors: [memory_limiter, transform/usage_events, batch]
+          exporters: [debug, kafka/usage_events]
+        traces:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [debug]
+        metrics:
+          receivers: [otlp]
+          processors: [memory_limiter, batch]
+          exporters: [debug]

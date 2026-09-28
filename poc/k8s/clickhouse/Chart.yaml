@@ -1,0 +1,13 @@
+apiVersion: v2
+name: clickhouse
+description: Umbrella chart pinning Altinity's ClickHouse chart (Control Plane A, usage warehouse) for this POC
+version: 0.1.0
+
+# Same pattern as the other component charts -- pin + override only, no
+# vendored source. This one chart bundles the Altinity Operator as a
+# dependency AND creates the actual ClickHouseInstallation CR -- one
+# component, one folder, matching this project's convention.
+dependencies:
+  - name: clickhouse
+    version: 0.3.13
+    repository: https://helm.altinity.com

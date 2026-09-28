@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Pre-commit safety check: scans staged file contents and filenames for
+# likely secrets/certs before allowing a commit. Catches the class of
+# mistake this project has hit before (corporate TLS-interception certs
+# committed by accident) without needing to remember to check manually
+# every time. Bypass deliberately with `git commit --no-verify` if a match
+# is a false positive.
+set -euo pipefail
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED_FILES" ]; then
+    exit 0
+fi
+
+CONTENT_PATTERN='BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|BEGIN CERTIFICATE|AKIA[0-9A-Z]{16}|sk_live_[0-9a-zA-Z]{20,}|sk_test_[0-9a-zA-Z]{20,}|ghp_[0-9a-zA-Z]{30,}|gho_[0-9a-zA-Z]{30,}|xox[baprs]-[0-9a-zA-Z-]{10,}'
+NAME_PATTERN='\.pem$|\.key$|\.p12$|\.pfx$|id_rsa$|id_ed25519$|credentials\.json$|\.env$'
+
+FOUND=0
+
+while IFS= read -r file; do
+    [ -z "$file" ] && continue
+
+    # Skip this hook's own source -- its pattern definitions contain the
+    # literal marker strings (e.g. "BEGIN PRIVATE KEY") as plain text, which
+    # otherwise trips the content scan on itself every time it's edited.
+    if [ "$file" = ".githooks/pre-commit" ]; then
+        continue
+    fi
+
+    if echo "$file" | grep -qiE "$NAME_PATTERN"; then
+        echo "pre-commit: suspicious filename staged: $file" >&2
+        FOUND=1
+    fi
+
+    if [ -f "$file" ] && git diff --cached -- "$file" | grep -qE "$CONTENT_PATTERN"; then
+        echo "pre-commit: possible secret/cert pattern found in $file" >&2
+        FOUND=1
+    fi
+done <<< "$STAGED_FILES"
+
+if [ "$FOUND" -eq 1 ]; then
+    echo "" >&2
+    echo "pre-commit: aborting -- review the file(s) above." >&2
+    echo "If this is a false positive, bypass with: git commit --no-verify" >&2
+    exit 1
+fi
+
+exit 0

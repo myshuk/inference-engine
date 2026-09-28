@@ -1,0 +1,4 @@
+# Overrides for the strimzi-kafka-operator subchart, pinned in Chart.yaml.
+# Defaults (watch only the release namespace, replicas: 1) are already right
+# for this single-namespace POC -- nothing to override yet.
+strimzi-kafka-operator: {}
