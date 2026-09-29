@@ -1583,3 +1583,179 @@ pytest -v
 
 Not built this phase: Stripe (explicitly skipped, not deferred -- see README.md item 4). Phase 6 is
 otherwise done.
+
+## Phase 7 -- skipped, not deferred
+
+Checked whether Phase 7 (model registry, stubbed/symbolic -- SeaweedFS + a local OCI registry) maps to any
+of the 6 acceptance criteria before building it:
+
+```bash
+grep -n "Phase 7" poc/README.md
+# Result: only the Phase 7 header itself -- not referenced anywhere in the acceptance criteria section
+```
+
+Criteria 1-6 map to Phases 1, 1, 2, 2, 6, 8 respectively -- nothing maps to Phase 7. It exists purely for
+"every control plane in the wiki gets a stand-in," explicitly not on the real request path, proving nothing
+the POC doesn't already prove without it. Skipped outright, not deferred.
+
+Also discussed and deferred: Argo CD/OpenBao/Trivy/Falco (Phase 5's item 3 -- GitOps, secrets, supply
+chain). None affect whether a request flows correctly, same as Phase 7, but unlike Phase 7 these ARE
+legitimate production-operations concerns this POC just doesn't need to prove -- kept as an open, undecided
+extended goal (same footing as KEDA), not skipped outright.
+
+## Phase 8 -- acceptance criterion 6 test matrix
+
+Criteria 1-5 each already have a specific test from the phase that built them. Phase 8 is criterion 6
+specifically -- 5 named scenarios, run against the full assembled path, not individual components in
+isolation.
+
+### SSE framing, disconnect/drain, rate-limit -- poc/tests/test_13_request_edge_cases.py
+
+```bash
+# Rigorous SSE framing check: parses the raw byte stream directly (r.raw.read()), not iter_lines()'s
+# higher-level view (test_01's level of rigor) -- splits on "\n\n", checks every event starts with
+# "data: ", validates JSON, confirms a terminating "data: [DONE]".
+#
+# Disconnect/drain: reads one line of a streaming response then r.close()'s mid-stream: a follow-up
+# request succeeding immediately afterward is the observable proxy for "no hung connection" from a
+# black-box pytest client (can't directly inspect server-side goroutine/connection state).
+pytest test_13_request_edge_cases.py -v
+# Result (first pass): 2 passed, 2 failed -- invalid API key and rate-limit both got a real 200, not a
+# test bug in either case (investigated both below).
+```
+
+**Invalid API key: confirmed as a genuine, pre-existing, documented gap**, not something broken by this
+session's other changes:
+
+```bash
+cat poc/k8s/rls/agentgateway-policy.yaml
+# Result: the file's own comment already says it -- "No real API-key authentication is wired yet (that's
+# Band 3's separate APIKeyAuthentication policy, not built) -- the descriptor value is read directly from
+# an x-api-key request header for now."
+```
+
+Investigated two ways to build it for real (both discussed with the user, both set aside as extended goals
+rather than built now):
+
+```bash
+kubectl --context kind-inference-poc explain agentgatewaypolicy.spec.traffic.apiKeyAuthentication --api-version=agentgateway.dev/v1alpha1
+# Result: only supports static keys via a Kubernetes Secret/ConfigMap (secretRef/secretSelector/
+# configMapSelector) -- wrong fit, would make the Secret the source of truth instead of Postgres,
+# contradicting the criterion's own wording ("Postgres/Valkey remain the source of truth").
+
+kubectl --context kind-inference-poc explain agentgatewaypolicy.spec.traffic.extAuth --api-version=agentgateway.dev/v1alpha1
+# Result: DOES support an external HTTP/gRPC authorization server per request (same architectural pattern
+# already used for RLS) -- the real fix, not built. Would need a small service querying Postgres's
+# api_keys table in real time, wired via extAuth.http + failureMode: FailClosed.
+```
+
+Also considered fronting agentgateway with a dedicated API gateway (Kong/Apigee) instead -- discussed with
+the user and set aside: Kong doesn't read from an arbitrary existing Postgres table either (it has its own
+consumer/credential store), so it would either need to become the new source of truth itself (same problem)
+or run a custom plugin doing the identical Postgres check an extAuth policy would, adding a whole extra
+gateway hop and Helm release without removing the actual work. Also a genuine scope expansion -- the wiki
+mentions Kong exactly once, only for the developer portal (D10), never as a data-plane component.
+
+Marked `xfail` with the full reasoning inline, not silently skipped -- the marker itself becomes the signal
+to remove once this is actually built:
+
+```python
+@pytest.mark.xfail(reason="...", strict=True)
+def test_invalid_api_key_is_rejected(gateway_port):
+    ...
+```
+
+**Rate-limit rejection: genuinely working, but the test needed fixing, not the system.**
+
+```bash
+time (for i in $(seq 1 62); do curl -s -o /dev/null -X POST http://localhost:18080/v1/chat/completions \
+  -H "x-api-key: pytest-timing-check" -d '{"model":"mock","messages":[{"role":"user","content":"hi"}]}'; done)
+# Result: 1:03.93 total -- LONGER than RLS's 60-second RPM window. Sequential requests let the window
+# quietly reset mid-test, so the limit is never actually hit; not a real gap.
+```
+
+Rewrote the test to fire all 61 requests concurrently (`concurrent.futures.ThreadPoolExecutor`), keeping
+them within the same window; asserts on counts (60 successes, 1 rejection) since concurrent requests don't
+guarantee arrival order:
+
+```bash
+pytest test_13_request_edge_cases.py -v
+# Result: 3 passed, 1 xfailed -- SSE framing, disconnect/drain, and rate-limit (fixed) all pass; invalid
+# API key correctly reports xfailed
+```
+
+### Upstream failure -- poc/tests/test_14_upstream_failure.py, extends mock_server.py
+
+Two genuinely distinct failure modes: a backend reachable but erroring, and a backend completely gone.
+Extended `poc/k8s/mock-servers/mock_server.py` with a `force_status` control (`POST /control
+{"force_status": 500}`, `0` = disabled) for the first; used a real `kubectl scale --replicas=0` for the
+second, not just an app-level simulation.
+
+```bash
+# Regenerated the ConfigMap per its own header convention after editing mock_server.py:
+kubectl create configmap vllm-mock-server-code --from-file=mock_server.py --dry-run=client -o yaml > configmap.yaml
+kubectl --context kind-inference-poc -n inference-poc apply -f configmap.yaml
+kubectl --context kind-inference-poc -n inference-poc rollout restart deployment vllm-mock-a vllm-mock-b
+```
+
+EPP picks whichever mock reports the lower load -- doesn't know or care about error/availability state, so
+forcing/scaling down only ONE mock wouldn't reliably prove anything (EPP could just keep routing to the
+other, healthy one). Both mocks always failed/scaled together in both tests.
+
+```bash
+# Manual check before writing the test:
+curl -s -X POST http://localhost:18000/control -d '{"force_status": 500}'
+curl -s -X POST http://localhost:18001/control -d '{"force_status": 500}'
+curl -s -o /dev/null -w "status: %{http_code}, time: %{time_total}s\n" -X POST http://localhost:18080/v1/chat/completions ...
+# Result: status: 500, time: 1.02s -- clean, fast, no hang, no gateway crash
+
+kubectl --context kind-inference-poc -n inference-poc scale deployment vllm-mock-a vllm-mock-b --replicas=0
+curl -s -X POST http://localhost:18080/v1/chat/completions ... --max-time 15
+# Result: status 503 in 0.044s -- "inference error: ServiceUnavailable - failed to find endpoint
+# candidates for serving the request". Even faster/cleaner than the 5xx case.
+```
+
+Writing the pod-scale-down test surfaced two real bugs in the test helper usage itself, both fixed:
+
+```bash
+# Bug 1: kubectl wait's own --timeout=30s and the Python subprocess wrapper's default timeout=30 can race
+# -- subprocess.TimeoutExpired fired first and masked kubectl's own graceful exit. Fixed by passing a
+# Python-level timeout comfortably larger than kubectl's own (--timeout=30s -> Python timeout=40;
+# --timeout=60s -> Python timeout=70).
+#
+# Bug 2: kubectl wait --for=delete also exits 0 immediately if the selector already matches nothing at
+# invocation time, AND a terminating pod briefly reports phase=Failed before the API server fully removes
+# it -- neither a bare "wait succeeded" nor a single synchronous "get pods" snapshot right after robustly
+# proves the pods are actually gone. Added an explicit poll (_wait_for_pod_phases) checking the real
+# phase list rather than trusting either kubectl's exit code or one snapshot in time.
+```
+
+Also added explicit pod-health checks the user asked for specifically: a baseline check (both mocks
+`Running`) before disrupting anything, and a stronger post-restore check (both mocks confirmed `Running`
+again, not just `kubectl wait --for=condition=Ready` exiting 0) in the `finally` block.
+
+```bash
+pytest test_14_upstream_failure.py -v
+# Result: 2 passed -- both the 5xx and pod-scale-down scenarios confirmed clean, fast failures with full
+# recovery afterward
+```
+
+### Carry-forward items -- already covered, no new tests needed
+
+Checked test_03_epp_routing.py and test_08_rls.py before writing anything new for these:
+- EPP not-round-robin: test_03's `test_selection_flips_when_load_flips` already proves it -- flipping
+  which mock reports lower load flips every single pick, which round-robin couldn't produce.
+- RLS reserved-at-estimate/no-refund: test_08's `test_no_refund_mechanism_exists` already proves it
+  structurally -- no Amend RPC exists at all, and `hits_addend` is unsigned so a negative value can't even
+  be encoded.
+
+### Full suite, zero regressions
+
+```bash
+pytest -v
+# Result: 37 passed, 4 skipped (vLLM not running), 1 xfailed (invalid API key, known gap) -- 42 total,
+# zero regressions across all 14 test files
+```
+
+Phase 8 done. Invalid API key remains an open, deliberate extended goal (same footing as KEDA) -- ask
+again later, not decided against.

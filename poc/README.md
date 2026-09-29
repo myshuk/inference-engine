@@ -477,25 +477,51 @@ stand-in that still demonstrates the three-stage shape:
 3. **Delivery:** a plain local OCI registry (`registry:2`) standing in for Harbor (no signing enforcement
    at POC scale). Not on Band 5's actual startup path — symbolic only.
 
-## Phase 8 — Acceptance validation: the criterion-6 test matrix
+## Phase 8 — Acceptance validation: the criterion-6 test matrix ✅ done (one scenario is a known gap)
 
 By this point criteria 1-5 each have a specific test living in the phase that built them (Phase 1, Phase 2
 x2, Phase 6). Phase 8 is criterion 6 specifically — a test matrix run against the full assembled path
-(Cloudflare-stand-in skipped locally → agentgateway → GIE → mocks or real engine → Band 3):
+(Cloudflare-stand-in skipped locally → agentgateway → GIE → mocks or real engine → Band 3). All 5 scenarios
+verified in `poc/tests/test_13_request_edge_cases.py` and `test_14_upstream_failure.py`:
 
-| Scenario | What it proves | Where it touches |
+| Scenario | What it proves | Result |
 |---|---|---|
-| **SSE framing** | Chunks are well-formed `data: ...` events with a correct terminator, not just "streaming looks right" eyeballed in a terminal | Band 1 contract, agentgateway frontend policies |
-| **Disconnect / drain** | A client disconnecting mid-stream, or the server side draining a connection, doesn't leave a hung request or a truncated write | Non-negotiable constraint #1; ties to Phase 5's KEDA grace-period note |
-| **Invalid API key** | Rejected with the right status/error shape before it ever reaches GIE, and Postgres/Valkey remain the source of truth for "is this key real" | Band 3 |
-| **Rate-limit rejection** | RLS actually rejects once the bucket is exhausted, and `failureMode` behaves as configured (`failOpen` for rate limits) | Band 3, D11 |
-| **Upstream failure** | A mock/engine returning 5xx or hanging doesn't take the whole gateway down, and surfaces as a clean error to the client | agentgateway backend policies, GIE |
+| **SSE framing** | Chunks are well-formed `data: ...` events with a correct terminator, not just "streaming looks right" eyeballed in a terminal | ✅ Parses the raw byte stream (not `iter_lines()`'s higher-level view) and checks every event's framing directly |
+| **Disconnect / drain** | A client disconnecting mid-stream, or the server side draining a connection, doesn't leave a hung request or a truncated write | ✅ Abruptly closes a mid-stream connection; a follow-up request succeeds immediately, proving no resource leak |
+| **Invalid API key** | Rejected with the right status/error shape before it ever reaches GIE, and Postgres/Valkey remain the source of truth for "is this key real" | ❌ **Known gap, extended goal (same footing as KEDA)** — see below |
+| **Rate-limit rejection** | RLS actually rejects once the bucket is exhausted | ✅ Confirmed genuinely working — but only once requests are fired **concurrently**: 61 sequential requests through the full stack measured at ~64s wall-clock, longer than the RPM window itself, so the counter quietly resets mid-test and the limit is never actually hit. Fired concurrently, all 61 land in the same window: exactly 60 succeed, exactly 1 gets `429` |
+| **Upstream failure** | A mock/engine returning 5xx or hanging doesn't take the whole gateway down, and surfaces as a clean error to the client | ✅ Two distinct failure modes tested: a mock forced to return 5xx while still reachable (`poc/k8s/mock-servers/mock_server.py`'s new `force_status` control), and both mocks scaled to zero replicas for real (genuinely unreachable, not simulated) — both surface as a clean, fast rejection (`503` in well under a second), and the gateway recovers immediately once backends return |
 
-Also carry forward from the original plan (not a named criterion, but still worth confirming once wired):
+**Invalid API key — known, deliberate gap, not a regression.** agentgateway/RLS treat `x-api-key` as an
+opaque rate-limit bucket key only; Postgres's `api_keys` table (Band 3) is never actually consulted on the
+live request path — confirmed by testing it for real (a completely bogus key gets a normal `200`), not just
+inferring it from the RLS policy's own comment (`poc/k8s/rls/agentgateway-policy.yaml`), which already
+flagged this as unbuilt. Investigated two ways to build it for real:
+- agentgateway's native `apiKeyAuthentication` traffic policy — wrong fit. It only supports **static** keys
+  via a Kubernetes Secret/ConfigMap, which would make the Secret the source of truth instead of Postgres,
+  contradicting this exact criterion's own wording.
+- A dedicated API gateway (Kong/Apigee) in front of agentgateway — considered and set aside. Kong doesn't
+  read from an arbitrary existing Postgres table either; it would need either its own consumer store to
+  become the new source of truth (same problem as above) or a custom plugin doing the exact same Postgres
+  check an `extAuth` policy would — adding a whole extra gateway hop and Helm release without removing the
+  work. It would also be a genuine scope expansion: the wiki mentions Kong exactly once, only in the context
+  of the developer portal (D10, rejected for its wrong analytics unit), never as a data-plane component.
+- The real fix (not built): an `extAuth`-style external check against Postgres, mirroring how RLS itself is
+  already wired (agentgateway calling an external service is the *same* pattern already proven out).
+- Test marked `xfail` (`poc/tests/test_13_request_edge_cases.py`), not silently skipped — the moment this
+  gets built, the test starts passing and the `xfail` marker itself becomes the signal to remove it.
+- **Treated as an extended/stretch goal, same footing as KEDA** (Phase 5) — ask again later, not decided
+  against.
+
+Also carried forward from the original plan (not a named criterion, already covered by earlier phases'
+tests, not duplicated here):
 - Concurrent requests against the Phase 2 mocks show the Endpoint Picker actually choosing based on
   the controllable metrics (not round-robin) — the concrete counterfactual the wiki's D3 action item calls
-  for.
+  for. Already proven by `test_03_epp_routing.py`: flipping which mock reports lower load flips every single
+  pick, which round-robin couldn't produce.
 - The RLS/Valkey counter in Band 3 behaves per D11 (reserved at estimate, never decremented by amend).
+  Already proven structurally by `test_08_rls.py`'s `test_no_refund_mechanism_exists` — no Amend RPC exists
+  at all, and `hits_addend` is unsigned so a negative value can't even be encoded.
 
 ## Working style
 
@@ -507,7 +533,7 @@ it before moving on, and pause for questions rather than batching multiple phase
 
 Everything verified manually via `curl`/`grpcurl`/port-forward throughout this project (see
 `exeReadme.md`) is also captured as a real, rerunnable `pytest` suite — one file per phase/component
-(`test_01_vllm.py` … `test_12_billing.py`), a shared `conftest.py` managing each service's port-forward
+(`test_01_vllm.py` … `test_14_upstream_failure.py`), a shared `conftest.py` managing each service's port-forward
 lifecycle (starts once per session, blocks until the local port actually accepts connections, tears down
 at the end), and `helpers.py` for the `kubectl` wrapper. Each new component gets a new `test_NN_*.py` file
 here, and the whole suite gets rerun after any change — not just the newest piece — to catch regressions

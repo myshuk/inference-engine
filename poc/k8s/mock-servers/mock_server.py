@@ -7,7 +7,11 @@ client to get a valid OpenAI-shaped response:
                              vllm:kv_cache_usage_perc (the names queue-scorer /
                              kv-cache-utilization-scorer actually read)
   - GET  /control           current metric values, as JSON
-  - POST /control           set metric values, e.g. {"num_requests_waiting": 50}
+  - POST /control           set metric values, e.g. {"num_requests_waiting": 50},
+                             or {"force_status": 500} to make /v1/chat/completions
+                             immediately fail with that status (0 = disabled,
+                             normal behavior) -- for Phase 8's upstream-failure
+                             scenario (acceptance criterion 6)
   - POST /v1/chat/completions   streaming + non-streaming, response content
                                  identifies which pod answered
 """
@@ -27,6 +31,7 @@ state_lock = threading.Lock()
 state = {
     "num_requests_waiting": float(os.environ.get("INIT_NUM_REQUESTS_WAITING", "0")),
     "kv_cache_usage_perc": float(os.environ.get("INIT_KV_CACHE_USAGE_PERC", "0.1")),
+    "force_status": 0,  # 0 = disabled; nonzero makes /v1/chat/completions fail immediately
 }
 
 
@@ -92,6 +97,8 @@ class Handler(BaseHTTPRequestHandler):
                 for key in ("num_requests_waiting", "kv_cache_usage_perc"):
                     if key in body:
                         state[key] = float(body[key])
+                if "force_status" in body:
+                    state["force_status"] = int(body["force_status"])
                 result = dict(state)
             self._send_json(200, result)
             return
@@ -103,6 +110,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def _handle_chat_completions(self, body):
+        with state_lock:
+            force_status = state["force_status"]
+        if force_status:
+            self._send_json(force_status, {
+                "error": {"message": f"mock forced failure (force_status={force_status})", "type": "mock_error"}
+            })
+            return
+
         messages = body.get("messages", [])
         model = body.get("model", MODEL_NAME)
         stream = bool(body.get("stream", False))
